@@ -1,6 +1,7 @@
 import io
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -123,153 +124,139 @@ def get_trial_label(rep_number, trial_type):
     return "Concentric" if odd else "Eccentric"
 
 
-def has_true_nearby(mask, index, window_size):
-    start = max(0, index - window_size)
-    end = min(len(mask), index + window_size + 1)
-    return bool(mask.iloc[start:end].any())
-
-
-def find_torque_peak_indices(
-    working,
-    valid_velocity,
-    peak_threshold_fraction=0.05,
-    min_peak_distance_samples=10,
-    smoothing_window=5,
-):
+def get_smoothed_position_direction(working, smoothing_window=7):
     """
-    Identifies separate torque peaks.
-
-    This is deliberately peak-centred so that each torque peak is treated as a
-    separate repetition, rather than relying only on broad velocity-valid windows.
+    Uses the position trace to estimate movement direction.
+    Positive values indicate increasing position.
+    Negative values indicate decreasing position.
     """
 
-    torque_abs = working["Torque(Newton-Meters)"].abs()
+    position = working["Position(Degrees)"].copy()
 
-    if len(torque_abs) < 3:
-        return []
-
-    smooth = torque_abs.rolling(
+    smooth_position = position.rolling(
         window=smoothing_window,
         center=True,
         min_periods=1,
-    ).mean()
+    ).median()
 
-    max_torque = float(smooth.max())
+    position_change = smooth_position.diff()
 
-    if max_torque <= 0:
-        return []
+    direction = np.sign(position_change)
+    direction = pd.Series(direction, index=working.index)
 
-    peak_threshold = max(5.0, max_torque * peak_threshold_fraction)
+    direction = direction.replace(0, np.nan)
+    direction = direction.ffill().bfill()
+    direction = direction.fillna(0)
 
-    candidate_peaks = []
+    return smooth_position, direction
 
-    for i in range(1, len(smooth) - 1):
-        previous_value = smooth.iloc[i - 1]
-        current_value = smooth.iloc[i]
-        next_value = smooth.iloc[i + 1]
 
-        is_local_peak = current_value >= previous_value and current_value > next_value
-        is_large_enough = current_value >= peak_threshold
-        has_velocity_match = has_true_nearby(valid_velocity, i, window_size=10)
+def find_position_direction_boundaries(
+    working,
+    smoothing_window=7,
+    min_position_change_fraction=0.08,
+    min_position_change_degrees=5.0,
+    min_samples_between_boundaries=5,
+):
+    """
+    Identifies rep boundaries from position direction changes.
 
-        if is_local_peak and is_large_enough and has_velocity_match:
-            candidate_peaks.append(i)
+    A rep boundary is accepted only if there is a meaningful position change
+    between direction changes. This prevents small noisy reversals in position
+    from being counted as separate reps.
+    """
 
-    if len(candidate_peaks) == 0:
-        return []
-
-    candidate_peaks = sorted(
-        candidate_peaks,
-        key=lambda idx: smooth.iloc[idx],
-        reverse=True,
+    smooth_position, direction = get_smoothed_position_direction(
+        working=working,
+        smoothing_window=smoothing_window,
     )
 
-    selected_peaks = []
+    n = len(working)
 
-    for peak_idx in candidate_peaks:
-        too_close = False
+    if n < 3:
+        return [0, n - 1]
 
-        for selected_idx in selected_peaks:
-            if abs(peak_idx - selected_idx) < min_peak_distance_samples:
-                too_close = True
-                break
+    position_range = float(
+        working["Position(Degrees)"].max() - working["Position(Degrees)"].min()
+    )
 
-        if not too_close:
-            selected_peaks.append(peak_idx)
+    min_position_change = max(
+        min_position_change_degrees,
+        position_range * min_position_change_fraction,
+    )
 
-    selected_peaks = sorted(selected_peaks)
+    raw_change_points = []
 
-    return selected_peaks
+    for i in range(1, n):
+        previous_direction = direction.iloc[i - 1]
+        current_direction = direction.iloc[i]
+
+        if previous_direction == 0 or current_direction == 0:
+            continue
+
+        if current_direction != previous_direction:
+            raw_change_points.append(i)
+
+    raw_boundaries = [0] + raw_change_points + [n - 1]
+
+    accepted_boundaries = [raw_boundaries[0]]
+    last_accepted_idx = raw_boundaries[0]
+    last_accepted_position = float(smooth_position.iloc[last_accepted_idx])
+
+    for candidate_idx in raw_boundaries[1:-1]:
+        if candidate_idx - last_accepted_idx < min_samples_between_boundaries:
+            continue
+
+        candidate_position = float(smooth_position.iloc[candidate_idx])
+        position_change = abs(candidate_position - last_accepted_position)
+
+        if position_change >= min_position_change:
+            accepted_boundaries.append(candidate_idx)
+            last_accepted_idx = candidate_idx
+            last_accepted_position = candidate_position
+
+    if accepted_boundaries[-1] != n - 1:
+        accepted_boundaries.append(n - 1)
+
+    accepted_boundaries = sorted(list(set(accepted_boundaries)))
+
+    return accepted_boundaries
 
 
-def find_rep_start_index(
+def refine_segment_to_movement(
     working,
+    start_idx,
+    end_idx,
     valid_velocity,
-    peak_idx,
-    left_limit,
     torque_threshold,
-    consecutive_points=5,
 ):
     """
-    Finds the start of a rep by moving backwards from the peak until the trace
-    has returned to a low-torque and non-valid-velocity region.
+    Refines a position-based segment so that the exported rep starts and ends
+    around the actual movement, rather than including too much quiet baseline.
     """
 
-    torque_abs = working["Torque(Newton-Meters)"].abs()
-    movement_mask = (torque_abs > torque_threshold) | valid_velocity
+    segment = working.iloc[start_idx:end_idx + 1].copy()
+    segment_valid_velocity = valid_velocity.iloc[start_idx:end_idx + 1]
 
-    start_idx = left_limit
+    torque_abs = segment["Torque(Newton-Meters)"].abs()
 
-    low_count = 0
+    movement_mask = (
+        segment_valid_velocity.reset_index(drop=True)
+        | (torque_abs.reset_index(drop=True) > torque_threshold)
+    )
 
-    for i in range(peak_idx, left_limit - 1, -1):
-        if not bool(movement_mask.iloc[i]):
-            low_count += 1
-            if low_count >= consecutive_points:
-                start_idx = i + consecutive_points
-                break
-        else:
-            low_count = 0
-            start_idx = i
+    movement_indices = np.where(movement_mask.to_numpy())[0]
 
-    start_idx = max(left_limit, min(start_idx, peak_idx))
+    if len(movement_indices) == 0:
+        return start_idx, end_idx
 
-    return start_idx
+    refined_start = start_idx + int(movement_indices[0])
+    refined_end = start_idx + int(movement_indices[-1])
 
+    if refined_end <= refined_start:
+        return start_idx, end_idx
 
-def find_rep_end_index(
-    working,
-    valid_velocity,
-    peak_idx,
-    right_limit,
-    torque_threshold,
-    consecutive_points=5,
-):
-    """
-    Finds the end of a rep by moving forwards from the peak until the trace
-    has returned to a low-torque and non-valid-velocity region.
-    """
-
-    torque_abs = working["Torque(Newton-Meters)"].abs()
-    movement_mask = (torque_abs > torque_threshold) | valid_velocity
-
-    end_idx = right_limit
-
-    low_count = 0
-
-    for i in range(peak_idx, right_limit + 1):
-        if not bool(movement_mask.iloc[i]):
-            low_count += 1
-            if low_count >= consecutive_points:
-                end_idx = i - consecutive_points
-                break
-        else:
-            low_count = 0
-            end_idx = i
-
-    end_idx = min(right_limit, max(end_idx, peak_idx))
-
-    return end_idx
+    return refined_start, refined_end
 
 
 def identify_reps_with_velocity_rule(
@@ -280,15 +267,12 @@ def identify_reps_with_velocity_rule(
     consecutive_points=10,
 ):
     """
-    Peak-centred rep detection using a 2% velocity threshold.
+    Rep detection using:
+    - +/- 2% target velocity threshold
+    - position direction change to confirm rep changes
 
-    Key logic:
-    1. A velocity-valid sample is defined as being within +/- 2% of the target velocity.
-    2. Torque peaks are identified from the absolute torque trace.
-    3. Each detected torque peak is treated as a separate rep.
-    4. Rep start and end are then estimated around each peak using a combination of:
-       - torque returning close to baseline
-       - velocity moving outside the target window
+    This prevents multiple local torque peaks within the same movement from
+    being incorrectly counted as separate repetitions.
     """
 
     working = df.copy().reset_index(drop=True)
@@ -307,54 +291,67 @@ def identify_reps_with_velocity_rule(
 
     torque_threshold = max(5.0, max_torque * 0.03)
 
-    peak_indices = find_torque_peak_indices(
+    boundaries = find_position_direction_boundaries(
         working=working,
-        valid_velocity=valid_velocity,
-        peak_threshold_fraction=0.05,
-        min_peak_distance_samples=consecutive_points,
-        smoothing_window=5,
+        smoothing_window=7,
+        min_position_change_fraction=0.08,
+        min_position_change_degrees=5.0,
+        min_samples_between_boundaries=consecutive_points,
     )
 
-    if len(peak_indices) == 0:
-        return pd.DataFrame(), pd.DataFrame()
-
     reps = []
+    rep_number = 0
 
-    for idx, peak_idx in enumerate(peak_indices):
-        rep_number = idx + 1
+    position_range = float(
+        working["Position(Degrees)"].max() - working["Position(Degrees)"].min()
+    )
 
-        if idx == 0:
-            left_limit = 0
-        else:
-            left_limit = int((peak_indices[idx - 1] + peak_idx) / 2)
+    min_rep_position_change = max(5.0, position_range * 0.08)
+    min_rep_samples = max(5, int(consecutive_points / 2))
 
-        if idx == len(peak_indices) - 1:
-            right_limit = len(working) - 1
-        else:
-            right_limit = int((peak_idx + peak_indices[idx + 1]) / 2)
-
-        start_idx = find_rep_start_index(
-            working=working,
-            valid_velocity=valid_velocity,
-            peak_idx=peak_idx,
-            left_limit=left_limit,
-            torque_threshold=torque_threshold,
-            consecutive_points=5,
-        )
-
-        end_idx = find_rep_end_index(
-            working=working,
-            valid_velocity=valid_velocity,
-            peak_idx=peak_idx,
-            right_limit=right_limit,
-            torque_threshold=torque_threshold,
-            consecutive_points=5,
-        )
+    for boundary_number in range(len(boundaries) - 1):
+        start_idx = int(boundaries[boundary_number])
+        end_idx = int(boundaries[boundary_number + 1])
 
         if end_idx <= start_idx:
             continue
 
-        rep_df = working.iloc[start_idx:end_idx + 1].copy()
+        if end_idx - start_idx + 1 < min_rep_samples:
+            continue
+
+        segment = working.iloc[start_idx:end_idx + 1].copy()
+
+        position_change = abs(
+            float(segment["Position(Degrees)"].iloc[-1])
+            - float(segment["Position(Degrees)"].iloc[0])
+        )
+
+        if position_change < min_rep_position_change:
+            continue
+
+        segment_valid_velocity = valid_velocity.iloc[start_idx:end_idx + 1]
+        segment_torque_peak = float(segment["Torque(Newton-Meters)"].abs().max())
+
+        if not bool(segment_valid_velocity.any()) and segment_torque_peak < torque_threshold:
+            continue
+
+        refined_start, refined_end = refine_segment_to_movement(
+            working=working,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            valid_velocity=valid_velocity,
+            torque_threshold=torque_threshold,
+        )
+
+        if refined_end <= refined_start:
+            continue
+
+        rep_df = working.iloc[refined_start:refined_end + 1].copy()
+
+        if len(rep_df) < min_rep_samples:
+            continue
+
+        rep_number += 1
         rep_df["Rep"] = rep_number
         rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
         reps.append(rep_df)
@@ -559,7 +556,8 @@ def main():
         "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
         "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
         "Individual rep plots are shown as Torque vs Angle/Position. Reps are identified "
-        "using a peak-centred approach with a +/- 2% target-velocity threshold."
+        "using a +/- 2% target-velocity threshold, with position direction changes used "
+        "to confirm rep transitions."
     )
 
     uploaded = st.file_uploader(
@@ -607,7 +605,7 @@ def main():
     with controls[2]:
         st.markdown("**Rep detection rule**")
         st.write("Velocity match uses +/- 2% of target velocity.")
-        st.write("Each torque peak is identified as a separate rep.")
+        st.write("Position direction change confirms each new rep.")
 
     st.subheader("Raw torque-time plot")
 
@@ -633,7 +631,8 @@ def main():
 
     if reps_long.empty:
         st.warning(
-            "No reps were identified with the current target velocity and +/- 2% rule."
+            "No reps were identified with the current target velocity, +/- 2% rule, "
+            "and position-direction-change rule."
         )
         return
 
