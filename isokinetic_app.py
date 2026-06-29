@@ -42,21 +42,16 @@ def standardise_dataframe(df):
     if df.shape[1] < 4:
         raise ValueError("The selected file has fewer than 4 columns.")
 
-    # Keep only first 4 columns
     df = df.iloc[:, :4].copy()
 
-    # If first row looks like a repeated header row, remove it
     if len(df) > 0 and looks_like_header_row(df.iloc[0].tolist()):
         df = df.iloc[1:].reset_index(drop=True)
 
-    # Standardise column names
     df.columns = EXPECTED_COLS
 
-    # Convert to numeric
     for col in EXPECTED_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows missing essential values
     df = df.dropna(
         subset=[
             "Time(Seconds)",
@@ -107,7 +102,7 @@ def read_uploaded_to_df(uploaded_file, selected_sheet=None):
         df = pd.read_excel(
             uploaded_file,
             sheet_name=selected_sheet,
-            engine=engine
+            engine=engine,
         )
 
     else:
@@ -125,23 +120,175 @@ def get_trial_label(rep_number, trial_type):
     if trial_type == "Ecc/Ecc":
         return "Eccentric Extensors" if odd else "Eccentric Flexors"
 
-    # Con/Ecc
     return "Concentric" if odd else "Eccentric"
+
+
+def has_true_nearby(mask, index, window_size):
+    start = max(0, index - window_size)
+    end = min(len(mask), index + window_size + 1)
+    return bool(mask.iloc[start:end].any())
+
+
+def find_torque_peak_indices(
+    working,
+    valid_velocity,
+    peak_threshold_fraction=0.05,
+    min_peak_distance_samples=10,
+    smoothing_window=5,
+):
+    """
+    Identifies separate torque peaks.
+
+    This is deliberately peak-centred so that each torque peak is treated as a
+    separate repetition, rather than relying only on broad velocity-valid windows.
+    """
+
+    torque_abs = working["Torque(Newton-Meters)"].abs()
+
+    if len(torque_abs) < 3:
+        return []
+
+    smooth = torque_abs.rolling(
+        window=smoothing_window,
+        center=True,
+        min_periods=1,
+    ).mean()
+
+    max_torque = float(smooth.max())
+
+    if max_torque <= 0:
+        return []
+
+    peak_threshold = max(5.0, max_torque * peak_threshold_fraction)
+
+    candidate_peaks = []
+
+    for i in range(1, len(smooth) - 1):
+        previous_value = smooth.iloc[i - 1]
+        current_value = smooth.iloc[i]
+        next_value = smooth.iloc[i + 1]
+
+        is_local_peak = current_value >= previous_value and current_value > next_value
+        is_large_enough = current_value >= peak_threshold
+        has_velocity_match = has_true_nearby(valid_velocity, i, window_size=10)
+
+        if is_local_peak and is_large_enough and has_velocity_match:
+            candidate_peaks.append(i)
+
+    if len(candidate_peaks) == 0:
+        return []
+
+    candidate_peaks = sorted(
+        candidate_peaks,
+        key=lambda idx: smooth.iloc[idx],
+        reverse=True,
+    )
+
+    selected_peaks = []
+
+    for peak_idx in candidate_peaks:
+        too_close = False
+
+        for selected_idx in selected_peaks:
+            if abs(peak_idx - selected_idx) < min_peak_distance_samples:
+                too_close = True
+                break
+
+        if not too_close:
+            selected_peaks.append(peak_idx)
+
+    selected_peaks = sorted(selected_peaks)
+
+    return selected_peaks
+
+
+def find_rep_start_index(
+    working,
+    valid_velocity,
+    peak_idx,
+    left_limit,
+    torque_threshold,
+    consecutive_points=5,
+):
+    """
+    Finds the start of a rep by moving backwards from the peak until the trace
+    has returned to a low-torque and non-valid-velocity region.
+    """
+
+    torque_abs = working["Torque(Newton-Meters)"].abs()
+    movement_mask = (torque_abs > torque_threshold) | valid_velocity
+
+    start_idx = left_limit
+
+    low_count = 0
+
+    for i in range(peak_idx, left_limit - 1, -1):
+        if not bool(movement_mask.iloc[i]):
+            low_count += 1
+            if low_count >= consecutive_points:
+                start_idx = i + consecutive_points
+                break
+        else:
+            low_count = 0
+            start_idx = i
+
+    start_idx = max(left_limit, min(start_idx, peak_idx))
+
+    return start_idx
+
+
+def find_rep_end_index(
+    working,
+    valid_velocity,
+    peak_idx,
+    right_limit,
+    torque_threshold,
+    consecutive_points=5,
+):
+    """
+    Finds the end of a rep by moving forwards from the peak until the trace
+    has returned to a low-torque and non-valid-velocity region.
+    """
+
+    torque_abs = working["Torque(Newton-Meters)"].abs()
+    movement_mask = (torque_abs > torque_threshold) | valid_velocity
+
+    end_idx = right_limit
+
+    low_count = 0
+
+    for i in range(peak_idx, right_limit + 1):
+        if not bool(movement_mask.iloc[i]):
+            low_count += 1
+            if low_count >= consecutive_points:
+                end_idx = i - consecutive_points
+                break
+        else:
+            low_count = 0
+            end_idx = i
+
+    end_idx = min(right_limit, max(end_idx, peak_idx))
+
+    return end_idx
 
 
 def identify_reps_with_velocity_rule(
     df,
     target_velocity,
     trial_type,
-    tolerance_fraction=0.01,
+    tolerance_fraction=0.02,
     consecutive_points=10,
 ):
     """
-    Rep start:
-        first point of 10 consecutive samples within ±1% of target velocity
+    Peak-centred rep detection using a 2% velocity threshold.
 
-    Rep end:
-        last point before 10 consecutive samples outside ±1% of target velocity
+    Key logic:
+    1. A velocity-valid sample is defined as being within +/- 2% of the target velocity.
+    2. Torque peaks are identified from the absolute torque trace.
+    3. Each detected torque peak is treated as a separate rep.
+    4. Rep start and end are then estimated around each peak using a combination of:
+       - torque returning close to baseline
+       - velocity moving outside the target window
     """
 
     working = df.copy().reset_index(drop=True)
@@ -149,48 +296,65 @@ def identify_reps_with_velocity_rule(
     lower = abs(target_velocity) * (1 - tolerance_fraction)
     upper = abs(target_velocity) * (1 + tolerance_fraction)
 
-    # Use absolute speed magnitude for the target velocity match
     working["Abs Speed(d/s)"] = working["Speed(d/s)"].abs()
-    valid = working["Abs Speed(d/s)"].between(lower, upper)
+    valid_velocity = working["Abs Speed(d/s)"].between(lower, upper)
+
+    torque_abs = working["Torque(Newton-Meters)"].abs()
+    max_torque = float(torque_abs.max())
+
+    if max_torque <= 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    torque_threshold = max(5.0, max_torque * 0.03)
+
+    peak_indices = find_torque_peak_indices(
+        working=working,
+        valid_velocity=valid_velocity,
+        peak_threshold_fraction=0.05,
+        min_peak_distance_samples=consecutive_points,
+        smoothing_window=5,
+    )
+
+    if len(peak_indices) == 0:
+        return pd.DataFrame(), pd.DataFrame()
 
     reps = []
-    in_rep = False
-    start_idx = None
-    rep_number = 0
-    i = 0
-    n = len(working)
 
-    while i <= n - consecutive_points:
-        if not in_rep:
-            # Rep starts at the first point of 10 consecutive valid samples
-            if bool(valid.iloc[i:i + consecutive_points].all()):
-                in_rep = True
-                start_idx = i
-                rep_number += 1
-                i += consecutive_points
-                continue
+    for idx, peak_idx in enumerate(peak_indices):
+        rep_number = idx + 1
 
+        if idx == 0:
+            left_limit = 0
         else:
-            # Rep ends at the last point before 10 consecutive invalid samples
-            if bool((~valid.iloc[i:i + consecutive_points]).all()):
-                end_idx = i - 1
+            left_limit = int((peak_indices[idx - 1] + peak_idx) / 2)
 
-                if end_idx >= start_idx:
-                    rep_df = working.iloc[start_idx:end_idx + 1].copy()
-                    rep_df["Rep"] = rep_number
-                    rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
-                    reps.append(rep_df)
+        if idx == len(peak_indices) - 1:
+            right_limit = len(working) - 1
+        else:
+            right_limit = int((peak_idx + peak_indices[idx + 1]) / 2)
 
-                in_rep = False
-                start_idx = None
-                i += consecutive_points
-                continue
+        start_idx = find_rep_start_index(
+            working=working,
+            valid_velocity=valid_velocity,
+            peak_idx=peak_idx,
+            left_limit=left_limit,
+            torque_threshold=torque_threshold,
+            consecutive_points=5,
+        )
 
-        i += 1
+        end_idx = find_rep_end_index(
+            working=working,
+            valid_velocity=valid_velocity,
+            peak_idx=peak_idx,
+            right_limit=right_limit,
+            torque_threshold=torque_threshold,
+            consecutive_points=5,
+        )
 
-    # If file ends during a rep, keep the final rep
-    if in_rep and start_idx is not None:
-        rep_df = working.iloc[start_idx:].copy()
+        if end_idx <= start_idx:
+            continue
+
+        rep_df = working.iloc[start_idx:end_idx + 1].copy()
         rep_df["Rep"] = rep_number
         rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
         reps.append(rep_df)
@@ -200,7 +364,6 @@ def identify_reps_with_velocity_rule(
 
     reps_long = pd.concat(reps, ignore_index=True)
 
-    # Build summary table
     summary_rows = []
 
     for rep_id, rep_df in reps_long.groupby("Rep", sort=True):
@@ -251,7 +414,7 @@ def filter_reps_for_export(reps_long, summary, reps_to_export):
 
 def make_raw_plot(df, summary=None, reps_to_export=None):
     """
-    Raw torque-time plot.
+    Raw data plot.
 
     This plot keeps time on the x-axis.
     If reps are supplied, identified reps are shaded:
@@ -265,7 +428,7 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
         df["Time(Seconds)"],
         df["Torque(Newton-Meters)"],
         color="tab:blue",
-        linewidth=1.3
+        linewidth=1.3,
     )
 
     if summary is not None and not summary.empty:
@@ -290,7 +453,7 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
                 start_time,
                 end_time,
                 color=shade_colour,
-                alpha=alpha
+                alpha=alpha,
             )
 
             mid_time = (start_time + end_time) / 2
@@ -303,7 +466,7 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
                 ha="center",
                 va="top",
                 fontsize=8,
-                rotation=90
+                rotation=90,
             )
 
         title = (
@@ -325,7 +488,7 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
 
 def make_rep_plot(rep_df, rep_type, rep_id):
     """
-    Individual rep torque-angle plot.
+    Individual rep plot.
 
     These subplots use angle/position on the x-axis.
     """
@@ -336,7 +499,7 @@ def make_rep_plot(rep_df, rep_type, rep_id):
         rep_df["Position(Degrees)"],
         rep_df["Torque(Newton-Meters)"],
         color="tab:orange",
-        linewidth=1.4
+        linewidth=1.4,
     )
 
     peak_idx = rep_df["Torque(Newton-Meters)"].abs().idxmax()
@@ -347,7 +510,7 @@ def make_rep_plot(rep_df, rep_type, rep_id):
         [peak_row["Torque(Newton-Meters)"]],
         color="red",
         s=35,
-        zorder=3
+        zorder=3,
     )
 
     ax.set_title(f"Rep {rep_id}: {rep_type}")
@@ -395,13 +558,13 @@ def main():
     st.write(
         "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
         "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
-        "Individual rep plots are shown as Torque vs Angle/Position. Reps are segmented "
-        "using the ±1% target-velocity rule with a 10-consecutive-sample start/end rule."
+        "Individual rep plots are shown as Torque vs Angle/Position. Reps are identified "
+        "using a peak-centred approach with a +/- 2% target-velocity threshold."
     )
 
     uploaded = st.file_uploader(
         "Upload data file",
-        type=["csv", "txt", "xlsx", "xls"]
+        type=["csv", "txt", "xlsx", "xls"],
     )
 
     if uploaded is None:
@@ -412,7 +575,6 @@ def main():
     file_name = uploaded.name.lower()
 
     try:
-        # Sheet selector shown before analysis for Excel files
         if file_name.endswith((".xlsx", ".xls")):
             sheets = get_excel_sheets(uploaded)
             selected_sheet = st.selectbox("Select the sheet to analyse", sheets)
@@ -431,7 +593,7 @@ def main():
     with controls[0]:
         trial_type = st.radio(
             "Trial type",
-            ["Con/Con", "Ecc/Ecc", "Con/Ecc"]
+            ["Con/Con", "Ecc/Ecc", "Con/Ecc"],
         )
 
     with controls[1]:
@@ -439,13 +601,13 @@ def main():
             "Target velocity (d/s)",
             min_value=0.0,
             value=60.0,
-            step=1.0
+            step=1.0,
         )
 
     with controls[2]:
-        st.markdown("**Velocity rule**")
-        st.write("Rep starts after 10 consecutive samples within ±1% of target velocity.")
-        st.write("Rep ends when 10 consecutive samples fall outside that window.")
+        st.markdown("**Rep detection rule**")
+        st.write("Velocity match uses +/- 2% of target velocity.")
+        st.write("Each torque peak is identified as a separate rep.")
 
     st.subheader("Raw torque-time plot")
 
@@ -465,13 +627,13 @@ def main():
         df=df,
         target_velocity=target_velocity,
         trial_type=trial_type,
-        tolerance_fraction=0.01,
+        tolerance_fraction=0.02,
         consecutive_points=10,
     )
 
     if reps_long.empty:
         st.warning(
-            "No reps were identified with the current target velocity and ±1% rule."
+            "No reps were identified with the current target velocity and +/- 2% rule."
         )
         return
 
@@ -492,7 +654,7 @@ def main():
         help=(
             "Use this if the automatic detection has identified too many reps. "
             "The export will include the first selected number of identified reps."
-        )
+        ),
     )
 
     reps_to_export = int(reps_to_export)
@@ -506,7 +668,7 @@ def main():
     reps_long_export, summary_export = filter_reps_for_export(
         reps_long=reps_long,
         summary=summary,
-        reps_to_export=reps_to_export
+        reps_to_export=reps_to_export,
     )
 
     st.subheader("Raw torque-time plot with identified reps")
@@ -514,7 +676,7 @@ def main():
     raw_fig_with_reps = make_raw_plot(
         df=df,
         summary=summary,
-        reps_to_export=reps_to_export
+        reps_to_export=reps_to_export,
     )
 
     st.pyplot(raw_fig_with_reps)
@@ -547,7 +709,7 @@ def main():
 
         for col_obj, rep_id in zip(
             row_cols,
-            rep_ids[row_start:row_start + cols_per_row]
+            rep_ids[row_start:row_start + cols_per_row],
         ):
             rep_df = reps_long_export[reps_long_export["Rep"] == rep_id]
             rep_type = rep_df["Rep Type"].iloc[0]
@@ -559,7 +721,7 @@ def main():
     excel_bytes = build_export_excel(
         raw_df=df,
         summary_df=summary_export,
-        reps_long_df=reps_long_export
+        reps_long_df=reps_long_export,
     )
 
     st.download_button(
