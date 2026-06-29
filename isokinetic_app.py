@@ -1,9 +1,12 @@
 import io
+import os
+import tempfile
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl.drawing.image import Image as XLImage
 
 
 EXPECTED_COLS = [
@@ -126,6 +129,18 @@ def get_trial_label(rep_number, trial_type):
         return "Eccentric Extensors" if odd else "Eccentric Flexors"
 
     return "Concentric" if odd else "Eccentric"
+
+
+def get_action_group(rep_type):
+    rep_type_text = str(rep_type)
+
+    if "Extensor" in rep_type_text:
+        return "Extensors"
+
+    if "Flexor" in rep_type_text:
+        return "Flexors"
+
+    return rep_type_text
 
 
 def get_smoothed_position_direction(working, smoothing_window=7):
@@ -398,6 +413,7 @@ def identify_reps_with_velocity_rule(
 
         rep_df["Rep"] = rep_number
         rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
+        rep_df["Action Group"] = get_action_group(rep_df["Rep Type"].iloc[0])
         rep_df["Velocity Valid Rep"] = rep_valid
         rep_df["Velocity Valid Fraction Angle Range"] = valid_fraction_angle_range
         rep_df["Velocity Validity Comment"] = invalid_reason
@@ -427,6 +443,7 @@ def identify_reps_with_velocity_rule(
             {
                 "Rep": int(rep_id),
                 "Rep Type": peak_row["Rep Type"],
+                "Action Group": peak_row["Action Group"],
                 "Velocity Valid Rep": bool(rep_df["Velocity Valid Rep"].iloc[0]),
                 "Velocity Validity Comment": str(
                     rep_df["Velocity Validity Comment"].iloc[0]
@@ -511,6 +528,7 @@ def calculate_torque_position_range_stats(reps_long_df, angle_lower, angle_upper
     if df_range.empty:
         return pd.DataFrame(
             columns=[
+                "Action Group",
                 "Rep Type",
                 "Position Range Lower (deg)",
                 "Position Range Upper (deg)",
@@ -523,7 +541,7 @@ def calculate_torque_position_range_stats(reps_long_df, angle_lower, angle_upper
             ]
         )
 
-    grouped = df_range.groupby("Rep Type", sort=True)
+    grouped = df_range.groupby(["Action Group", "Rep Type"], sort=True)
 
     stats = grouped.agg(
         Number_of_Reps=("Rep", "nunique"),
@@ -545,10 +563,141 @@ def calculate_torque_position_range_stats(reps_long_df, angle_lower, angle_upper
         }
     )
 
-    stats.insert(1, "Position Range Lower (deg)", float(angle_lower))
-    stats.insert(2, "Position Range Upper (deg)", float(angle_upper))
+    stats.insert(2, "Position Range Lower (deg)", float(angle_lower))
+    stats.insert(3, "Position Range Upper (deg)", float(angle_upper))
 
     return stats
+
+
+def create_mean_torque_position_curves(
+    reps_long_df,
+    angle_lower,
+    angle_upper,
+    n_points=101,
+):
+    """
+    Creates mean torque-position curves for included reps only.
+
+    Curves are grouped by Action Group:
+    - Flexors
+    - Extensors
+    - other action labels if Flexors/Extensors are not present
+
+    Each rep is interpolated onto a common position axis before calculating
+    mean and SD torque at each position.
+    """
+
+    if reps_long_df.empty:
+        return pd.DataFrame()
+
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
+
+    angle_grid = np.linspace(float(angle_lower), float(angle_upper), int(n_points))
+
+    curve_rows = []
+
+    for action_group, group_df in reps_long_df.groupby("Action Group", sort=True):
+        rep_curves = []
+
+        for rep_id, rep_df in group_df.groupby("Rep", sort=True):
+            rep_range = rep_df[
+                rep_df["Position(Degrees)"].between(
+                    angle_lower,
+                    angle_upper,
+                    inclusive="both",
+                )
+            ].copy()
+
+            if len(rep_range) < 2:
+                continue
+
+            rep_range = rep_range.sort_values("Position(Degrees)")
+
+            rep_range = (
+                rep_range.groupby("Position(Degrees)", as_index=False)
+                .agg({"Torque(Newton-Meters)": "mean"})
+                .sort_values("Position(Degrees)")
+            )
+
+            x = rep_range["Position(Degrees)"].to_numpy(dtype=float)
+            y = rep_range["Torque(Newton-Meters)"].to_numpy(dtype=float)
+
+            if len(np.unique(x)) < 2:
+                continue
+
+            interp_y = np.interp(angle_grid, x, y)
+            rep_curves.append(interp_y)
+
+        if len(rep_curves) == 0:
+            continue
+
+        curve_array = np.vstack(rep_curves)
+
+        mean_torque = np.nanmean(curve_array, axis=0)
+        sd_torque = np.nanstd(curve_array, axis=0, ddof=1)
+
+        if curve_array.shape[0] == 1:
+            sd_torque = np.zeros_like(mean_torque)
+
+        for idx, angle_value in enumerate(angle_grid):
+            curve_rows.append(
+                {
+                    "Action Group": action_group,
+                    "Position (deg)": float(angle_value),
+                    "Mean Torque (Nm)": float(mean_torque[idx]),
+                    "SD Torque (Nm)": float(sd_torque[idx]),
+                    "Number of Reps": int(curve_array.shape[0]),
+                }
+            )
+
+    return pd.DataFrame(curve_rows)
+
+
+def make_mean_torque_position_plot(mean_curve_df):
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    if mean_curve_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No mean torque-position data available",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+
+    for action_group, group_df in mean_curve_df.groupby("Action Group", sort=True):
+        x = group_df["Position (deg)"].to_numpy(dtype=float)
+        y = group_df["Mean Torque (Nm)"].to_numpy(dtype=float)
+        sd = group_df["SD Torque (Nm)"].to_numpy(dtype=float)
+
+        ax.plot(
+            x,
+            y,
+            linewidth=2.0,
+            label=f"{action_group} mean",
+        )
+
+        ax.fill_between(
+            x,
+            y - sd,
+            y + sd,
+            alpha=0.18,
+            label=f"{action_group} SD",
+        )
+
+    ax.set_title("Mean Torque-Position Curves for Included Reps")
+    ax.set_xlabel("Position (Degrees)")
+    ax.set_ylabel("Torque (Nm)")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+
+    fig.tight_layout()
+    return fig
 
 
 def make_raw_plot(df, summary=None, reps_to_export=None, reps_to_exclude=None):
@@ -732,7 +881,14 @@ def make_rep_plot(
     return fig
 
 
-def build_export_excel(raw_df, summary_df, reps_long_df, angle_lower, angle_upper):
+def build_export_excel(
+    raw_df,
+    summary_df,
+    reps_long_df,
+    angle_lower,
+    angle_upper,
+    mean_curve_df,
+):
     output = io.BytesIO()
 
     torque_stats_df = calculate_torque_position_range_stats(
@@ -741,25 +897,61 @@ def build_export_excel(raw_df, summary_df, reps_long_df, angle_lower, angle_uppe
         angle_upper=angle_upper,
     )
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        raw_df.to_excel(writer, sheet_name="Raw_Data", index=False)
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+    mean_curve_fig = make_mean_torque_position_plot(mean_curve_df)
 
-        torque_stats_df.to_excel(
-            writer,
-            sheet_name="Torque_Position_Range_Stats",
-            index=False,
-        )
+    temp_image_path = None
 
-        reps_export = reps_long_df.drop(columns=["Abs Speed(d/s)"], errors="ignore")
-        reps_export.to_excel(writer, sheet_name="All_Reps_Long", index=False)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            temp_image_path = tmp.name
+            mean_curve_fig.savefig(temp_image_path, dpi=200, bbox_inches="tight")
 
-        for rep_id, rep_df in reps_export.groupby("Rep", sort=True):
-            rep_type = rep_df["Rep Type"].iloc[0]
-            safe_type = rep_type.replace(" ", "_")[:20]
-            sheet_name = f"Rep_{int(rep_id)}_{safe_type}"[:31]
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            raw_df.to_excel(writer, sheet_name="Raw_Data", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
-            rep_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            torque_stats_df.to_excel(
+                writer,
+                sheet_name="Torque_Position_Range_Stats",
+                index=False,
+            )
+
+            mean_curve_df.to_excel(
+                writer,
+                sheet_name="Mean_Torque_Position_Data",
+                index=False,
+            )
+
+            figure_sheet = writer.book.create_sheet("Mean_Torque_Position_Figure")
+            figure_sheet["A1"] = "Mean torque-position figure for included reps only"
+            figure_sheet["A2"] = (
+                "Curves are grouped by action group and calculated over the selected "
+                "position range."
+            )
+
+            if temp_image_path is not None and os.path.exists(temp_image_path):
+                xl_image = XLImage(temp_image_path)
+                xl_image.anchor = "A4"
+                figure_sheet.add_image(xl_image)
+
+            reps_export = reps_long_df.drop(columns=["Abs Speed(d/s)"], errors="ignore")
+            reps_export.to_excel(writer, sheet_name="All_Reps_Long", index=False)
+
+            for rep_id, rep_df in reps_export.groupby("Rep", sort=True):
+                rep_type = rep_df["Rep Type"].iloc[0]
+                safe_type = rep_type.replace(" ", "_")[:20]
+                sheet_name = f"Rep_{int(rep_id)}_{safe_type}"[:31]
+
+                rep_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    finally:
+        plt.close(mean_curve_fig)
+
+        if temp_image_path is not None and os.path.exists(temp_image_path):
+            try:
+                os.remove(temp_image_path)
+            except OSError:
+                pass
 
     output.seek(0)
 
@@ -792,7 +984,7 @@ def main():
         - A lower-bound velocity threshold can be applied to identify reps where speed falls below the selected criterion.
         - The angle range for velocity checking and torque summary calculations can be manually changed.
         - Reps can be manually excluded from the final output.
-        - The Excel export includes raw data, summary data, all included repetitions, individual rep sheets, and mean/SD torque within the selected position range by action type.
+        - The Excel export includes raw data, summary data, all included repetitions, individual rep sheets, mean/SD torque within the selected position range, and a mean torque-position figure for included reps.
         """
     )
 
@@ -966,7 +1158,7 @@ def main():
         default=[],
         help=(
             "These reps will be removed from the Summary, All_Reps_Long, individual "
-            "rep sheets, rep figures, and torque mean/SD calculations."
+            "rep sheets, rep figures, torque mean/SD calculations, and mean curves."
         ),
     )
 
@@ -1003,6 +1195,13 @@ def main():
         angle_upper=angle_upper,
     )
 
+    mean_curve_df = create_mean_torque_position_curves(
+        reps_long_df=reps_long_export,
+        angle_lower=angle_lower,
+        angle_upper=angle_upper,
+        n_points=101,
+    )
+
     st.subheader("Raw torque-time plot with identified reps")
 
     raw_fig_with_reps = make_raw_plot(
@@ -1031,6 +1230,15 @@ def main():
     )
 
     st.dataframe(torque_stats_df, use_container_width=True)
+
+    st.subheader("Mean torque-position curves for included reps")
+
+    mean_curve_fig = make_mean_torque_position_plot(mean_curve_df)
+    st.pyplot(mean_curve_fig)
+    plt.close(mean_curve_fig)
+
+    with st.expander("Show mean torque-position curve data"):
+        st.dataframe(mean_curve_df, use_container_width=True)
 
     st.subheader("All automatically identified reps")
 
@@ -1077,6 +1285,7 @@ def main():
         reps_long_df=reps_long_export,
         angle_lower=angle_lower,
         angle_upper=angle_upper,
+        mean_curve_df=mean_curve_df,
     )
 
     excel_mime = (
