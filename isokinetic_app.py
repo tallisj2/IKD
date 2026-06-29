@@ -14,16 +14,10 @@ EXPECTED_COLS = [
 ]
 
 
-ANGLE_CHECK_LOWER = 20.0
-ANGLE_CHECK_UPPER = 60.0
-
-# The velocity rule is now lower-bound only:
-# speed must not be below 98% of target velocity.
-VELOCITY_TOLERANCE_FRACTION = 0.02
-
-# Set to 1.00 so velocity must be maintained across all available points
-# between 20 and 60 degrees.
-MIN_VALID_FRACTION_BETWEEN_20_60 = 1.00
+DEFAULT_ANGLE_CHECK_LOWER = 20.0
+DEFAULT_ANGLE_CHECK_UPPER = 60.0
+DEFAULT_VELOCITY_TOLERANCE_FRACTION = 0.02
+DEFAULT_MIN_VALID_FRACTION_BETWEEN_ANGLES = 1.00
 
 
 def normalise_header_text(value):
@@ -168,9 +162,6 @@ def find_position_direction_boundaries(
 ):
     """
     Identifies rep boundaries using position direction changes.
-
-    This prevents several torque fluctuations within one movement from being
-    incorrectly counted as separate reps.
     """
 
     smooth_position, direction = get_smoothed_position_direction(
@@ -235,15 +226,9 @@ def get_velocity_valid_mask(df, target_velocity, tolerance_fraction=0.02):
     """
     Lower-bound velocity rule only.
 
-    A sample is valid if absolute speed is greater than or equal to
-    target velocity minus 2%.
+    Valid speed = absolute speed >= target velocity x (1 - tolerance_fraction).
 
-    For example:
-    target velocity = 60 d/s
-    lower threshold = 58.8 d/s
-
-    Speeds above 60 d/s are valid.
-    Speeds below 58.8 d/s are invalid.
+    Speeds higher than the target velocity are valid.
     """
 
     lower = abs(target_velocity) * (1 - tolerance_fraction)
@@ -262,8 +247,6 @@ def get_velocity_based_rep_window(
     """
     Returns the first and last sample in the segment where speed is above
     the lower velocity threshold.
-
-    These points are used as the shaded start and shaded end points.
     """
 
     segment_valid = valid_velocity.iloc[start_idx:start_idx + len(segment)]
@@ -278,7 +261,7 @@ def get_velocity_based_rep_window(
     return shade_start_idx, shade_end_idx
 
 
-def check_velocity_maintained_between_20_60(
+def check_velocity_maintained_between_angles(
     rep_df,
     target_velocity,
     tolerance_fraction=0.02,
@@ -287,15 +270,14 @@ def check_velocity_maintained_between_20_60(
     required_valid_fraction=1.00,
 ):
     """
-    Checks whether velocity stays above the lower threshold between 20 and 60 degrees.
+    Checks whether velocity stays above the lower threshold between the selected
+    angle limits.
 
-    A rep is marked as valid only if:
-    - speed reaches the lower threshold at least once
-    - there are data points between 20 and 60 degrees
-    - all available points between 20 and 60 degrees are above the lower threshold
-
-    Speeds higher than the target velocity are allowed.
+    This is now manually adjustable in the app.
     """
+
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
 
     abs_speed, valid_velocity, lower = get_velocity_valid_mask(
         rep_df,
@@ -313,16 +295,25 @@ def check_velocity_maintained_between_20_60(
     )
 
     if not bool(angle_mask.any()):
-        return False, 0.0, "No data between 20 and 60 degrees"
+        return (
+            False,
+            0.0,
+            f"No data between {angle_lower:.1f} and {angle_upper:.1f} degrees",
+        )
 
     valid_between_angles = valid_velocity[angle_mask]
     valid_fraction = float(valid_between_angles.mean())
 
     if valid_fraction < required_valid_fraction:
+        required_percent = required_valid_fraction * 100
+        actual_percent = valid_fraction * 100
+
         reason = (
-            f"Speed dropped below lower threshold between 20 and 60 degrees "
-            f"({valid_fraction * 100:.1f}% valid)"
+            f"Speed dropped below lower threshold between "
+            f"{angle_lower:.1f} and {angle_upper:.1f} degrees "
+            f"({actual_percent:.1f}% valid; required {required_percent:.1f}%)"
         )
+
         return False, valid_fraction, reason
 
     return True, valid_fraction, "Valid"
@@ -334,22 +325,27 @@ def identify_reps_with_velocity_rule(
     trial_type,
     tolerance_fraction=0.02,
     consecutive_points=10,
+    angle_lower=20.0,
+    angle_upper=60.0,
+    required_valid_fraction=1.00,
 ):
     """
     Rep detection using:
-    - position direction changes to identify rep transitions
+    - position direction change to identify rep transitions
     - lower-bound velocity threshold for shaded start/end points
-    - red highlighting for reps that do not reach or do not maintain speed
-      above the lower threshold between 20 and 60 degrees
+    - manually adjustable angle-window validity check
 
     Important:
-    The 2% rule is NOT an upper/lower band.
-    It is only a lower threshold.
+    The 2% rule is lower-bound only.
 
-    Valid speed = absolute speed >= target velocity * 0.98
+    Valid speed = absolute speed >= target velocity x 0.98 by default.
+    Speeds higher than target are accepted.
     """
 
     working = df.copy().reset_index(drop=True)
+
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
 
     abs_speed, valid_velocity, lower_threshold = get_velocity_valid_mask(
         working,
@@ -425,20 +421,20 @@ def identify_reps_with_velocity_rule(
             export_start_idx = segment_start_idx
             export_end_idx = segment_end_idx
 
-        rep_valid, valid_fraction_20_60, invalid_reason = (
-            check_velocity_maintained_between_20_60(
+        rep_valid, valid_fraction_angle_range, invalid_reason = (
+            check_velocity_maintained_between_angles(
                 rep_df=rep_df,
                 target_velocity=target_velocity,
                 tolerance_fraction=tolerance_fraction,
-                angle_lower=ANGLE_CHECK_LOWER,
-                angle_upper=ANGLE_CHECK_UPPER,
-                required_valid_fraction=MIN_VALID_FRACTION_BETWEEN_20_60,
+                angle_lower=angle_lower,
+                angle_upper=angle_upper,
+                required_valid_fraction=required_valid_fraction,
             )
         )
 
         if not speed_reached_threshold:
             rep_valid = False
-            valid_fraction_20_60 = 0.0
+            valid_fraction_angle_range = 0.0
             invalid_reason = (
                 f"Speed never reached lower threshold of {lower_threshold:.2f} d/s"
             )
@@ -448,13 +444,16 @@ def identify_reps_with_velocity_rule(
         rep_df["Rep"] = rep_number
         rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
         rep_df["Velocity Valid Rep"] = rep_valid
-        rep_df["Velocity Valid Fraction 20-60 deg"] = valid_fraction_20_60
+        rep_df["Velocity Valid Fraction Angle Range"] = valid_fraction_angle_range
         rep_df["Velocity Validity Comment"] = invalid_reason
         rep_df["Segment Start Index"] = segment_start_idx
         rep_df["Segment End Index"] = segment_end_idx
         rep_df["Shade Start Index"] = export_start_idx
         rep_df["Shade End Index"] = export_end_idx
         rep_df["Lower Velocity Threshold (d/s)"] = lower_threshold
+        rep_df["Velocity Check Lower Angle (deg)"] = angle_lower
+        rep_df["Velocity Check Upper Angle (deg)"] = angle_upper
+        rep_df["Required Valid Fraction Angle Range"] = required_valid_fraction
 
         reps.append(rep_df)
 
@@ -471,8 +470,13 @@ def identify_reps_with_velocity_rule(
 
         velocity_valid_rep = bool(rep_df["Velocity Valid Rep"].iloc[0])
         validity_comment = str(rep_df["Velocity Validity Comment"].iloc[0])
-        valid_fraction = float(rep_df["Velocity Valid Fraction 20-60 deg"].iloc[0])
+        valid_fraction = float(rep_df["Velocity Valid Fraction Angle Range"].iloc[0])
         lower_threshold = float(rep_df["Lower Velocity Threshold (d/s)"].iloc[0])
+        angle_lower_value = float(rep_df["Velocity Check Lower Angle (deg)"].iloc[0])
+        angle_upper_value = float(rep_df["Velocity Check Upper Angle (deg)"].iloc[0])
+        required_valid_fraction_value = float(
+            rep_df["Required Valid Fraction Angle Range"].iloc[0]
+        )
 
         summary_rows.append(
             {
@@ -480,7 +484,10 @@ def identify_reps_with_velocity_rule(
                 "Rep Type": peak_row["Rep Type"],
                 "Velocity Valid Rep": velocity_valid_rep,
                 "Velocity Validity Comment": validity_comment,
-                "Velocity Valid Fraction 20-60 deg": valid_fraction,
+                "Velocity Valid Fraction Angle Range": valid_fraction,
+                "Velocity Check Lower Angle (deg)": angle_lower_value,
+                "Velocity Check Upper Angle (deg)": angle_upper_value,
+                "Required Valid Fraction Angle Range": required_valid_fraction_value,
                 "Lower Velocity Threshold (d/s)": lower_threshold,
                 "Start Time (s)": float(rep_df["Time(Seconds)"].iloc[0]),
                 "End Time (s)": float(rep_df["Time(Seconds)"].iloc[-1]),
@@ -495,6 +502,8 @@ def identify_reps_with_velocity_rule(
                 "Position at Peak (deg)": float(peak_row["Position(Degrees)"]),
                 "Speed at Peak (d/s)": float(peak_row["Speed(d/s)"]),
                 "Mean Speed Magnitude (d/s)": float(rep_df["Abs Speed(d/s)"].mean()),
+                "Minimum Speed Magnitude (d/s)": float(rep_df["Abs Speed(d/s)"].min()),
+                "Maximum Speed Magnitude (d/s)": float(rep_df["Abs Speed(d/s)"].max()),
                 "Samples in Rep": int(len(rep_df)),
             }
         )
@@ -525,8 +534,8 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
     Raw torque-time plot.
 
     Shading:
-    - green = rep speed reached and stayed above the lower threshold between 20 and 60 deg
-    - red = rep speed did not reach or did not stay above the lower threshold
+    - green = rep passed the manually selected velocity check
+    - red = rep failed the manually selected velocity check
     - grey = rep excluded by manual override
 
     The shaded window uses only the part of the rep where speed is above
@@ -602,56 +611,107 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
     return fig
 
 
-def make_rep_plot(rep_df, rep_type, rep_id):
+def make_rep_plot(
+    rep_df,
+    rep_type,
+    rep_id,
+    target_velocity,
+    tolerance_fraction,
+    angle_lower,
+    angle_upper,
+):
     """
     Individual rep plot.
 
     These subplots use angle/position on the x-axis.
+
+    Torque = left y-axis.
+    Velocity = right y-axis.
     """
 
-    fig, ax = plt.subplots(figsize=(5, 3.2))
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
+
+    lower_velocity_threshold = abs(target_velocity) * (1 - tolerance_fraction)
+
+    fig, ax1 = plt.subplots(figsize=(5.7, 3.6))
 
     rep_valid = bool(rep_df["Velocity Valid Rep"].iloc[0])
+    valid_fraction = float(rep_df["Velocity Valid Fraction Angle Range"].iloc[0])
 
     if rep_valid:
-        line_colour = "tab:orange"
+        torque_colour = "tab:orange"
+        title_suffix = "Valid"
     else:
-        line_colour = "tab:red"
+        torque_colour = "tab:red"
+        title_suffix = "Velocity issue"
 
-    ax.plot(
+    ax1.plot(
         rep_df["Position(Degrees)"],
         rep_df["Torque(Newton-Meters)"],
-        color=line_colour,
-        linewidth=1.4,
+        color=torque_colour,
+        linewidth=1.5,
+        label="Torque",
     )
 
     peak_idx = rep_df["Torque(Newton-Meters)"].abs().idxmax()
     peak_row = rep_df.loc[peak_idx]
 
-    ax.scatter(
+    ax1.scatter(
         [peak_row["Position(Degrees)"]],
         [peak_row["Torque(Newton-Meters)"]],
         color="black",
         s=35,
         zorder=3,
+        label="Peak torque",
     )
 
-    ax.axvspan(
-        ANGLE_CHECK_LOWER,
-        ANGLE_CHECK_UPPER,
+    ax1.axvspan(
+        angle_lower,
+        angle_upper,
         color="lightgray",
         alpha=0.18,
     )
 
-    if rep_valid:
-        title_suffix = "Valid"
-    else:
-        title_suffix = "Velocity issue"
+    ax1.set_xlabel("Angle / Position (Degrees)")
+    ax1.set_ylabel("Torque (Nm)")
+    ax1.grid(alpha=0.25)
 
-    ax.set_title(f"Rep {rep_id}: {rep_type} | {title_suffix}")
-    ax.set_xlabel("Angle / Position (Degrees)")
-    ax.set_ylabel("Torque (Nm)")
-    ax.grid(alpha=0.25)
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        rep_df["Position(Degrees)"],
+        rep_df["Abs Speed(d/s)"],
+        color="tab:purple",
+        linewidth=1.2,
+        linestyle="--",
+        label="Velocity",
+    )
+
+    ax2.axhline(
+        lower_velocity_threshold,
+        color="tab:green",
+        linewidth=1.1,
+        linestyle=":",
+        label="Lower velocity threshold",
+    )
+
+    ax2.set_ylabel("Velocity magnitude (d/s)")
+
+    ax1.set_title(
+        f"Rep {rep_id}: {rep_type} | {title_suffix} | "
+        f"{valid_fraction * 100:.0f}% valid"
+    )
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+
+    ax1.legend(
+        lines_1 + lines_2,
+        labels_1 + labels_2,
+        loc="best",
+        fontsize=7,
+    )
 
     fig.tight_layout()
 
@@ -695,9 +755,10 @@ def main():
     st.write(
         "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
         "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
-        "Individual rep plots are shown as Torque vs Angle/Position. Reps are identified "
-        "using position direction changes. The speed rule is lower-bound only: speed must "
-        "not fall below 98% of the target velocity. Speeds higher than target are accepted."
+        "Individual rep plots are shown as Torque vs Angle/Position, with velocity shown "
+        "on a secondary y-axis. Reps are identified using position direction changes. "
+        "The speed rule is lower-bound only: speed must not fall below the selected "
+        "percentage of the target velocity. Speeds higher than target are accepted."
     )
 
     uploaded = st.file_uploader(
@@ -743,10 +804,66 @@ def main():
         )
 
     with controls[2]:
-        st.markdown("**Rep detection rule**")
-        st.write("Lower threshold = target velocity x 0.98.")
-        st.write("Speeds above target are accepted.")
-        st.write("Red reps fall below the lower threshold between 20 and 60 degrees.")
+        tolerance_percent = st.number_input(
+            "Allowed drop below target velocity (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=2.0,
+            step=0.5,
+            help=(
+                "Default is 2%. This means speed must be at least 98% of target. "
+                "Speeds higher than target are accepted."
+            ),
+        )
+
+    velocity_tolerance_fraction = tolerance_percent / 100.0
+
+    st.subheader("Manual velocity validity rule")
+
+    validity_cols = st.columns(3)
+
+    with validity_cols[0]:
+        angle_lower = st.number_input(
+            "Velocity check lower angle (degrees)",
+            value=float(DEFAULT_ANGLE_CHECK_LOWER),
+            step=1.0,
+        )
+
+    with validity_cols[1]:
+        angle_upper = st.number_input(
+            "Velocity check upper angle (degrees)",
+            value=float(DEFAULT_ANGLE_CHECK_UPPER),
+            step=1.0,
+        )
+
+    with validity_cols[2]:
+        required_valid_percent = st.number_input(
+            "Required valid points in angle range (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=100.0,
+            step=5.0,
+            help=(
+                "100% means every point in the selected angle range must be above "
+                "the lower velocity threshold. Lower this if you want to allow "
+                "brief drops below the threshold."
+            ),
+        )
+
+    required_valid_fraction = required_valid_percent / 100.0
+
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
+
+    lower_velocity_threshold = abs(target_velocity) * (1 - velocity_tolerance_fraction)
+
+    st.info(
+        f"Current red-flag rule: a rep is highlighted red if speed is below "
+        f"{lower_velocity_threshold:.2f} d/s between {angle_lower:.1f} and "
+        f"{angle_upper:.1f} degrees for more than "
+        f"{100 - required_valid_percent:.1f}% of the available points. "
+        f"Speeds above target velocity are accepted."
+    )
 
     st.subheader("Raw torque-time plot")
 
@@ -766,8 +883,11 @@ def main():
         df=df,
         target_velocity=target_velocity,
         trial_type=trial_type,
-        tolerance_fraction=VELOCITY_TOLERANCE_FRACTION,
+        tolerance_fraction=velocity_tolerance_fraction,
         consecutive_points=10,
+        angle_lower=angle_lower,
+        angle_upper=angle_upper,
+        required_valid_fraction=required_valid_fraction,
     )
 
     if reps_long.empty:
@@ -782,7 +902,7 @@ def main():
 
     st.success(
         f"Automatic detection identified {automatically_identified_reps} reps. "
-        f"{valid_reps} passed the lower-threshold velocity check and "
+        f"{valid_reps} passed the current velocity check and "
         f"{invalid_reps} were flagged red."
     )
 
@@ -826,9 +946,8 @@ def main():
     plt.close(raw_fig_with_reps)
 
     st.caption(
-        "Green shaded regions are accepted reps. Red shaded regions are reps where speed "
-        "was below the lower velocity threshold between 20 and 60 degrees, or where the "
-        "threshold was never reached. Grey shaded regions are excluded by the manual override."
+        "Green shaded regions are accepted reps. Red shaded regions failed the current "
+        "manual velocity rule. Grey shaded regions are excluded by the manual override."
     )
 
     st.subheader("Rep summary table selected for export")
@@ -842,8 +961,9 @@ def main():
     st.subheader("Rep figures selected for export")
 
     st.write(
-        "These individual rep figures use angle/position on the x-axis. "
-        "The grey background band marks 20-60 degrees."
+        "Each individual rep figure shows torque against angle/position on the left axis "
+        "and velocity magnitude on the right axis. The grey band shows the selected angle "
+        "range used for the velocity check."
     )
 
     rep_ids = sorted(reps_long_export["Rep"].unique())
@@ -859,7 +979,16 @@ def main():
             rep_df = reps_long_export[reps_long_export["Rep"] == rep_id]
             rep_type = rep_df["Rep Type"].iloc[0]
 
-            fig = make_rep_plot(rep_df, rep_type, int(rep_id))
+            fig = make_rep_plot(
+                rep_df=rep_df,
+                rep_type=rep_type,
+                rep_id=int(rep_id),
+                target_velocity=target_velocity,
+                tolerance_fraction=velocity_tolerance_fraction,
+                angle_lower=angle_lower,
+                angle_upper=angle_upper,
+            )
+
             col_obj.pyplot(fig)
             plt.close(fig)
 
@@ -877,5 +1006,4 @@ def main():
     )
 
 
-if __name__ == "__main__":
-    main()
+if __name__ ==
