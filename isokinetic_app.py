@@ -13,11 +13,8 @@ EXPECTED_COLS = [
     "Speed(d/s)",
 ]
 
-
 DEFAULT_ANGLE_CHECK_LOWER = 20.0
 DEFAULT_ANGLE_CHECK_UPPER = 60.0
-DEFAULT_VELOCITY_TOLERANCE_FRACTION = 0.02
-DEFAULT_MIN_VALID_FRACTION_BETWEEN_ANGLES = 1.00
 
 
 def normalise_header_text(value):
@@ -160,10 +157,6 @@ def find_position_direction_boundaries(
     min_position_change_degrees=5.0,
     min_samples_between_boundaries=5,
 ):
-    """
-    Identifies rep boundaries using position direction changes.
-    """
-
     smooth_position, direction = get_smoothed_position_direction(
         working=working,
         smoothing_window=smoothing_window,
@@ -223,14 +216,6 @@ def find_position_direction_boundaries(
 
 
 def get_velocity_valid_mask(df, target_velocity, tolerance_fraction=0.02):
-    """
-    Lower-bound velocity rule only.
-
-    Valid speed = absolute speed >= target velocity x (1 - tolerance_fraction).
-
-    Speeds higher than the target velocity are valid.
-    """
-
     lower = abs(target_velocity) * (1 - tolerance_fraction)
 
     abs_speed = df["Speed(d/s)"].abs()
@@ -239,16 +224,7 @@ def get_velocity_valid_mask(df, target_velocity, tolerance_fraction=0.02):
     return abs_speed, valid_velocity, lower
 
 
-def get_velocity_based_rep_window(
-    segment,
-    start_idx,
-    valid_velocity,
-):
-    """
-    Returns the first and last sample in the segment where speed is above
-    the lower velocity threshold.
-    """
-
+def get_velocity_based_rep_window(segment, start_idx, valid_velocity):
     segment_valid = valid_velocity.iloc[start_idx:start_idx + len(segment)]
     true_positions = np.where(segment_valid.to_numpy())[0]
 
@@ -269,11 +245,6 @@ def check_velocity_maintained_between_angles(
     angle_upper=60.0,
     required_valid_fraction=1.00,
 ):
-    """
-    Checks whether velocity stays above the lower threshold between the selected
-    angle limits.
-    """
-
     if angle_upper < angle_lower:
         angle_lower, angle_upper = angle_upper, angle_lower
 
@@ -327,13 +298,6 @@ def identify_reps_with_velocity_rule(
     angle_upper=60.0,
     required_valid_fraction=1.00,
 ):
-    """
-    Rep detection using:
-    - position direction change to identify rep transitions
-    - lower-bound velocity threshold for shaded start/end points
-    - manually adjustable angle-window validity check
-    """
-
     working = df.copy().reset_index(drop=True)
 
     if angle_upper < angle_lower:
@@ -460,27 +424,29 @@ def identify_reps_with_velocity_rule(
         peak_idx = rep_df["Torque(Newton-Meters)"].abs().idxmax()
         peak_row = rep_df.loc[peak_idx]
 
-        velocity_valid_rep = bool(rep_df["Velocity Valid Rep"].iloc[0])
-        validity_comment = str(rep_df["Velocity Validity Comment"].iloc[0])
-        valid_fraction = float(rep_df["Velocity Valid Fraction Angle Range"].iloc[0])
-        lower_threshold = float(rep_df["Lower Velocity Threshold (d/s)"].iloc[0])
-        angle_lower_value = float(rep_df["Velocity Check Lower Angle (deg)"].iloc[0])
-        angle_upper_value = float(rep_df["Velocity Check Upper Angle (deg)"].iloc[0])
-        required_valid_fraction_value = float(
-            rep_df["Required Valid Fraction Angle Range"].iloc[0]
-        )
-
         summary_rows.append(
             {
                 "Rep": int(rep_id),
                 "Rep Type": peak_row["Rep Type"],
-                "Velocity Valid Rep": velocity_valid_rep,
-                "Velocity Validity Comment": validity_comment,
-                "Velocity Valid Fraction Angle Range": valid_fraction,
-                "Velocity Check Lower Angle (deg)": angle_lower_value,
-                "Velocity Check Upper Angle (deg)": angle_upper_value,
-                "Required Valid Fraction Angle Range": required_valid_fraction_value,
-                "Lower Velocity Threshold (d/s)": lower_threshold,
+                "Velocity Valid Rep": bool(rep_df["Velocity Valid Rep"].iloc[0]),
+                "Velocity Validity Comment": str(
+                    rep_df["Velocity Validity Comment"].iloc[0]
+                ),
+                "Velocity Valid Fraction Angle Range": float(
+                    rep_df["Velocity Valid Fraction Angle Range"].iloc[0]
+                ),
+                "Velocity Check Lower Angle (deg)": float(
+                    rep_df["Velocity Check Lower Angle (deg)"].iloc[0]
+                ),
+                "Velocity Check Upper Angle (deg)": float(
+                    rep_df["Velocity Check Upper Angle (deg)"].iloc[0]
+                ),
+                "Required Valid Fraction Angle Range": float(
+                    rep_df["Required Valid Fraction Angle Range"].iloc[0]
+                ),
+                "Lower Velocity Threshold (d/s)": float(
+                    rep_df["Lower Velocity Threshold (d/s)"].iloc[0]
+                ),
                 "Start Time (s)": float(rep_df["Time(Seconds)"].iloc[0]),
                 "End Time (s)": float(rep_df["Time(Seconds)"].iloc[-1]),
                 "Duration (s)": float(
@@ -506,14 +472,6 @@ def identify_reps_with_velocity_rule(
 
 
 def filter_reps_for_export(reps_long, summary, reps_to_export, reps_to_exclude=None):
-    """
-    Keeps only the selected automatically identified reps and removes any manually
-    excluded reps.
-
-    reps_to_export controls the first N reps considered.
-    reps_to_exclude removes specific reps from the final export.
-    """
-
     reps_to_export = int(reps_to_export)
 
     if reps_to_exclude is None:
@@ -534,16 +492,7 @@ def filter_reps_for_export(reps_long, summary, reps_to_export, reps_to_exclude=N
     return filtered_reps, filtered_summary
 
 
-def calculate_torque_position_range_stats(
-    reps_long_df,
-    angle_lower,
-    angle_upper,
-):
-    """
-    Calculates mean and SD torque within the selected position range for each
-    action type.
-    """
-
+def calculate_torque_position_range_stats(reps_long_df, angle_lower, angle_upper):
     if reps_long_df.empty:
         return pd.DataFrame()
 
@@ -603,21 +552,7 @@ def calculate_torque_position_range_stats(
     return stats
 
 
-def make_raw_plot(
-    df,
-    summary=None,
-    reps_to_export=None,
-    reps_to_exclude=None,
-):
-    """
-    Raw torque-time plot.
-
-    Shading:
-    - green = rep passed the manually selected velocity check
-    - red = rep failed the manually selected velocity check
-    - grey = rep excluded by manual override or beyond selected export count
-    """
-
+def make_raw_plot(df, summary=None, reps_to_export=None, reps_to_exclude=None):
     if reps_to_exclude is None:
         reps_to_exclude = []
 
@@ -709,13 +644,6 @@ def make_rep_plot(
     angle_lower,
     angle_upper,
 ):
-    """
-    Individual rep plot.
-
-    Torque = left y-axis.
-    Velocity = right y-axis.
-    """
-
     if angle_upper < angle_lower:
         angle_lower, angle_upper = angle_upper, angle_lower
 
@@ -805,22 +733,7 @@ def make_rep_plot(
     return fig
 
 
-def build_export_excel(
-    raw_df,
-    summary_df,
-    reps_long_df,
-    angle_lower,
-    angle_upper,
-):
-    """
-    Export everything into one Excel workbook with multiple tabs:
-    - Raw_Data
-    - Summary
-    - Torque_Position_Range_Stats
-    - All_Reps_Long
-    - one sheet per exported rep
-    """
-
+def build_export_excel(raw_df, summary_df, reps_long_df, angle_lower, angle_upper):
     output = io.BytesIO()
 
     torque_stats_df = calculate_torque_position_range_stats(
@@ -832,6 +745,7 @@ def build_export_excel(
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         raw_df.to_excel(writer, sheet_name="Raw_Data", index=False)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
         torque_stats_df.to_excel(
             writer,
             sheet_name="Torque_Position_Range_Stats",
@@ -864,11 +778,10 @@ def main():
         **Developed by Dr Jason Tallis**  
         **Contact:** AB0289@coventry.ac.uk
 
-        This app has been developed to support the processing of isokinetic dynamometry
-        trial data. It is designed to identify individual repetitions, inspect torque
-        and velocity traces, apply velocity-threshold quality checks, manually exclude
-        poor-quality or unwanted repetitions, and export cleaned repetition-level data
-        for further analysis.
+        This app supports the processing of isokinetic dynamometry trial data. It is
+        designed to identify individual repetitions, inspect torque and velocity traces,
+        apply velocity-threshold quality checks, manually exclude poor-quality or unwanted
+        repetitions, and export cleaned repetition-level data for further analysis.
 
         **Purpose and function**
 
@@ -882,12 +795,6 @@ def main():
         - Reps can be manually excluded from the final output.
         - The Excel export includes raw data, summary data, all included repetitions, individual rep sheets, and mean/SD torque within the selected position range by action type.
         """
-    )
-
-    st.write(
-        "Upload a data file and then adjust the trial type, target velocity, velocity "
-        "threshold, and position range as needed. The final export only includes the reps "
-        "selected for output and not manually excluded."
     )
 
     uploaded = st.file_uploader(
@@ -1177,4 +1084,4 @@ def main():
         label="Download selected reps as one Excel file (.xlsx)",
         data=excel_bytes,
         file_name="isokinetic_rep_analysis_selected_reps.xlsx",
-        mime="application/vnd.openxmlformats-off)
+        mime="application/vnd.openxmlformats-officed
