@@ -1079,8 +1079,18 @@ def main():
         angle_upper=angle_upper,
     )
 
+    excel_mime = (
+        "application/vnd.openxmlformats-officedocument."
+        "spreadsheetml.sheet"
+    )
+
     st.download_button(
         label="Download selected reps as one Excel file (.xlsx)",
         data=excel_bytes,
         file_name="isokinetic_rep_analysis_selected_reps.xlsx",
-        mime="application/vnd.openxmlformats-officedocument
+        mime=excel_mime,
+    )
+
+
+if __name__ == "__main__":
+    main()
