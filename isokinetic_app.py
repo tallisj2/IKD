@@ -79,7 +79,6 @@ def get_excel_sheets(uploaded_file):
         engine = "xlrd"
 
     xls = pd.ExcelFile(uploaded_file, engine=engine)
-
     return list(xls.sheet_names)
 
 
@@ -1084,4 +1083,4 @@ def main():
         label="Download selected reps as one Excel file (.xlsx)",
         data=excel_bytes,
         file_name="isokinetic_rep_analysis_selected_reps.xlsx",
-        mime="application/vnd.openxmlformats-officed
+        mime="application/vnd.openxmlformats-officedocument
