@@ -58,7 +58,12 @@ def standardise_dataframe(df):
 
     # Drop rows missing essential values
     df = df.dropna(
-        subset=["Time(Seconds)", "Torque(Newton-Meters)", "Speed(d/s)"]
+        subset=[
+            "Time(Seconds)",
+            "Position(Degrees)",
+            "Torque(Newton-Meters)",
+            "Speed(d/s)",
+        ]
     ).reset_index(drop=True)
 
     return df
@@ -164,6 +169,7 @@ def identify_reps_with_velocity_rule(
                 rep_number += 1
                 i += consecutive_points
                 continue
+
         else:
             # Rep ends at the last point before 10 consecutive invalid samples
             if bool((~valid.iloc[i:i + consecutive_points]).all()):
@@ -208,8 +214,11 @@ def identify_reps_with_velocity_rule(
                 "Start Time (s)": float(rep_df["Time(Seconds)"].iloc[0]),
                 "End Time (s)": float(rep_df["Time(Seconds)"].iloc[-1]),
                 "Duration (s)": float(
-                    rep_df["Time(Seconds)"].iloc[-1] - rep_df["Time(Seconds)"].iloc[0]
+                    rep_df["Time(Seconds)"].iloc[-1]
+                    - rep_df["Time(Seconds)"].iloc[0]
                 ),
+                "Start Position (deg)": float(rep_df["Position(Degrees)"].iloc[0]),
+                "End Position (deg)": float(rep_df["Position(Degrees)"].iloc[-1]),
                 "Peak Time (s)": float(peak_row["Time(Seconds)"]),
                 "Peak Torque (Nm)": float(peak_row["Torque(Newton-Meters)"]),
                 "Position at Peak (deg)": float(peak_row["Position(Degrees)"]),
@@ -224,8 +233,33 @@ def identify_reps_with_velocity_rule(
     return reps_long, summary
 
 
-def make_raw_plot(df):
-    fig, ax = plt.subplots(figsize=(10, 4))
+def filter_reps_for_export(reps_long, summary, reps_to_export):
+    """
+    Keeps only the first selected number of automatically identified reps.
+
+    This does not create new reps. It only controls how many of the identified
+    reps are included in the final summary, figures, and Excel export.
+    """
+
+    reps_to_export = int(reps_to_export)
+
+    filtered_reps = reps_long[reps_long["Rep"] <= reps_to_export].copy()
+    filtered_summary = summary[summary["Rep"] <= reps_to_export].copy()
+
+    return filtered_reps, filtered_summary
+
+
+def make_raw_plot(df, summary=None, reps_to_export=None):
+    """
+    Raw torque-time plot.
+
+    This plot keeps time on the x-axis.
+    If reps are supplied, identified reps are shaded:
+    - green = included in export
+    - red = identified but excluded by manual override
+    """
+
+    fig, ax = plt.subplots(figsize=(11, 4.5))
 
     ax.plot(
         df["Time(Seconds)"],
@@ -234,7 +268,53 @@ def make_raw_plot(df):
         linewidth=1.3
     )
 
-    ax.set_title("Torque vs Time")
+    if summary is not None and not summary.empty:
+        automatically_identified = int(summary["Rep"].nunique())
+
+        if reps_to_export is None:
+            reps_to_export = automatically_identified
+
+        for _, row in summary.iterrows():
+            rep_number = int(row["Rep"])
+            start_time = float(row["Start Time (s)"])
+            end_time = float(row["End Time (s)"])
+
+            if rep_number <= reps_to_export:
+                shade_colour = "tab:green"
+                alpha = 0.18
+            else:
+                shade_colour = "tab:red"
+                alpha = 0.12
+
+            ax.axvspan(
+                start_time,
+                end_time,
+                color=shade_colour,
+                alpha=alpha
+            )
+
+            mid_time = (start_time + end_time) / 2
+            y_top = df["Torque(Newton-Meters)"].max()
+
+            ax.text(
+                mid_time,
+                y_top,
+                f"Rep {rep_number}",
+                ha="center",
+                va="top",
+                fontsize=8,
+                rotation=90
+            )
+
+        title = (
+            f"Raw Torque vs Time | Automatically identified reps: "
+            f"{automatically_identified} | Reps selected for export: {int(reps_to_export)}"
+        )
+
+    else:
+        title = "Raw Torque vs Time"
+
+    ax.set_title(title)
     ax.set_xlabel("Time (Seconds)")
     ax.set_ylabel("Torque (Newton-Meters)")
     ax.grid(alpha=0.25)
@@ -244,10 +324,16 @@ def make_raw_plot(df):
 
 
 def make_rep_plot(rep_df, rep_type, rep_id):
+    """
+    Individual rep torque-angle plot.
+
+    These subplots use angle/position on the x-axis.
+    """
+
     fig, ax = plt.subplots(figsize=(5, 3.2))
 
     ax.plot(
-        rep_df["Time(Seconds)"],
+        rep_df["Position(Degrees)"],
         rep_df["Torque(Newton-Meters)"],
         color="tab:orange",
         linewidth=1.4
@@ -257,7 +343,7 @@ def make_rep_plot(rep_df, rep_type, rep_id):
     peak_row = rep_df.loc[peak_idx]
 
     ax.scatter(
-        [peak_row["Time(Seconds)"]],
+        [peak_row["Position(Degrees)"]],
         [peak_row["Torque(Newton-Meters)"]],
         color="red",
         s=35,
@@ -265,7 +351,7 @@ def make_rep_plot(rep_df, rep_type, rep_id):
     )
 
     ax.set_title(f"Rep {rep_id}: {rep_type}")
-    ax.set_xlabel("Time (Seconds)")
+    ax.set_xlabel("Angle / Position (Degrees)")
     ax.set_ylabel("Torque (Nm)")
     ax.grid(alpha=0.25)
 
@@ -279,8 +365,9 @@ def build_export_excel(raw_df, summary_df, reps_long_df):
     - Raw_Data
     - Summary
     - All_Reps_Long
-    - one sheet per rep
+    - one sheet per exported rep
     """
+
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -293,7 +380,7 @@ def build_export_excel(raw_df, summary_df, reps_long_df):
         for rep_id, rep_df in reps_export.groupby("Rep", sort=True):
             rep_type = rep_df["Rep Type"].iloc[0]
             safe_type = rep_type.replace(" ", "_")[:20]
-            sheet_name = f"Rep_{int(rep_id)}_{safe_type}"[:31]  # Excel limit
+            sheet_name = f"Rep_{int(rep_id)}_{safe_type}"[:31]
 
             rep_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
@@ -307,9 +394,9 @@ def main():
 
     st.write(
         "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
-        "Time, Position, Torque, and Speed, shows the raw torque-time trace, and then "
-        "segments reps using the ±1% target-velocity rule with a 10-consecutive-sample "
-        "start/end rule."
+        "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
+        "Individual rep plots are shown as Torque vs Angle/Position. Reps are segmented "
+        "using the ±1% target-velocity rule with a 10-consecutive-sample start/end rule."
     )
 
     uploaded = st.file_uploader(
@@ -339,11 +426,6 @@ def main():
     st.subheader("Loaded data preview")
     st.dataframe(df.head(15), use_container_width=True)
 
-    st.subheader("Raw torque-time plot")
-    raw_fig = make_raw_plot(df)
-    st.pyplot(raw_fig)
-    plt.close(raw_fig)
-
     controls = st.columns(3)
 
     with controls[0]:
@@ -365,47 +447,129 @@ def main():
         st.write("Rep starts after 10 consecutive samples within ±1% of target velocity.")
         st.write("Rep ends when 10 consecutive samples fall outside that window.")
 
-    if st.button("Run analysis", type="primary"):
-        reps_long, summary = identify_reps_with_velocity_rule(
-            df=df,
-            target_velocity=target_velocity,
-            trial_type=trial_type,
-            tolerance_fraction=0.01,
-            consecutive_points=10,
+    st.subheader("Raw torque-time plot")
+
+    raw_fig = make_raw_plot(df)
+    st.pyplot(raw_fig)
+    plt.close(raw_fig)
+
+    run_analysis = st.button("Run analysis", type="primary")
+
+    if run_analysis:
+        st.session_state["analysis_has_run"] = True
+
+    if not st.session_state.get("analysis_has_run", False):
+        return
+
+    reps_long, summary = identify_reps_with_velocity_rule(
+        df=df,
+        target_velocity=target_velocity,
+        trial_type=trial_type,
+        tolerance_fraction=0.01,
+        consecutive_points=10,
+    )
+
+    if reps_long.empty:
+        st.warning(
+            "No reps were identified with the current target velocity and ±1% rule."
+        )
+        return
+
+    automatically_identified_reps = int(summary["Rep"].nunique())
+
+    st.success(
+        f"Automatic detection identified {automatically_identified_reps} reps."
+    )
+
+    st.subheader("Manual rep override for final export")
+
+    reps_to_export = st.number_input(
+        "How many of the identified reps should be included in the final export?",
+        min_value=1,
+        max_value=automatically_identified_reps,
+        value=automatically_identified_reps,
+        step=1,
+        help=(
+            "Use this if the automatic detection has identified too many reps. "
+            "The export will include the first selected number of identified reps."
+        )
+    )
+
+    reps_to_export = int(reps_to_export)
+
+    if reps_to_export < automatically_identified_reps:
+        st.warning(
+            f"{automatically_identified_reps} reps were automatically identified, "
+            f"but only the first {reps_to_export} reps will be included in the final export."
         )
 
-        if reps_long.empty:
-            st.warning(
-                "No reps were identified with the current target velocity and ±1% rule."
-            )
-            return
+    reps_long_export, summary_export = filter_reps_for_export(
+        reps_long=reps_long,
+        summary=summary,
+        reps_to_export=reps_to_export
+    )
 
-        st.subheader("Rep summary table")
+    st.subheader("Raw torque-time plot with identified reps")
+
+    raw_fig_with_reps = make_raw_plot(
+        df=df,
+        summary=summary,
+        reps_to_export=reps_to_export
+    )
+
+    st.pyplot(raw_fig_with_reps)
+    plt.close(raw_fig_with_reps)
+
+    st.caption(
+        "Green shaded regions are reps selected for export. "
+        "Red shaded regions are reps identified automatically but excluded by the manual override."
+    )
+
+    st.subheader("Rep summary table selected for export")
+    st.dataframe(summary_export, use_container_width=True)
+
+    st.subheader("All automatically identified reps")
+
+    with st.expander("Show full automatic detection summary"):
         st.dataframe(summary, use_container_width=True)
 
-        st.subheader("Rep figures")
-        rep_ids = sorted(reps_long["Rep"].unique())
-        cols_per_row = 2
+    st.subheader("Rep figures selected for export")
 
-        for row_start in range(0, len(rep_ids), cols_per_row):
-            row_cols = st.columns(cols_per_row)
+    st.write(
+        "These individual rep figures use angle/position on the x-axis."
+    )
 
-            for col_obj, rep_id in zip(row_cols, rep_ids[row_start:row_start + cols_per_row]):
-                rep_df = reps_long[reps_long["Rep"] == rep_id]
-                rep_type = rep_df["Rep Type"].iloc[0]
-                fig = make_rep_plot(rep_df, rep_type, int(rep_id))
-                col_obj.pyplot(fig)
-                plt.close(fig)
+    rep_ids = sorted(reps_long_export["Rep"].unique())
+    cols_per_row = 2
 
-        excel_bytes = build_export_excel(df, summary, reps_long)
+    for row_start in range(0, len(rep_ids), cols_per_row):
+        row_cols = st.columns(cols_per_row)
 
-        st.download_button(
-            label="Download all outputs as one Excel file (.xlsx)",
-            data=excel_bytes,
-            file_name="isokinetic_rep_analysis.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        for col_obj, rep_id in zip(
+            row_cols,
+            rep_ids[row_start:row_start + cols_per_row]
+        ):
+            rep_df = reps_long_export[reps_long_export["Rep"] == rep_id]
+            rep_type = rep_df["Rep Type"].iloc[0]
+
+            fig = make_rep_plot(rep_df, rep_type, int(rep_id))
+            col_obj.pyplot(fig)
+            plt.close(fig)
+
+    excel_bytes = build_export_excel(
+        raw_df=df,
+        summary_df=summary_export,
+        reps_long_df=reps_long_export
+    )
+
+    st.download_button(
+        label="Download selected reps as one Excel file (.xlsx)",
+        data=excel_bytes,
+        file_name="isokinetic_rep_analysis_selected_reps.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 if __name__ == "__main__":
     main()
+``
