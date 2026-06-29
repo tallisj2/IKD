@@ -14,6 +14,12 @@ EXPECTED_COLS = [
 ]
 
 
+ANGLE_CHECK_LOWER = 20.0
+ANGLE_CHECK_UPPER = 60.0
+VELOCITY_TOLERANCE_FRACTION = 0.02
+MIN_VALID_FRACTION_BETWEEN_20_60 = 0.95
+
+
 def normalise_header_text(value):
     return (
         str(value)
@@ -125,12 +131,6 @@ def get_trial_label(rep_number, trial_type):
 
 
 def get_smoothed_position_direction(working, smoothing_window=7):
-    """
-    Uses the position trace to estimate movement direction.
-    Positive values indicate increasing position.
-    Negative values indicate decreasing position.
-    """
-
     position = working["Position(Degrees)"].copy()
 
     smooth_position = position.rolling(
@@ -159,11 +159,10 @@ def find_position_direction_boundaries(
     min_samples_between_boundaries=5,
 ):
     """
-    Identifies rep boundaries from position direction changes.
+    Identifies rep boundaries using position direction changes.
 
-    A rep boundary is accepted only if there is a meaningful position change
-    between direction changes. This prevents small noisy reversals in position
-    from being counted as separate reps.
+    This prevents several torque fluctuations within one movement from being
+    incorrectly counted as separate reps.
     """
 
     smooth_position, direction = get_smoothed_position_direction(
@@ -223,40 +222,88 @@ def find_position_direction_boundaries(
     return accepted_boundaries
 
 
-def refine_segment_to_movement(
-    working,
+def get_velocity_valid_mask(df, target_velocity, tolerance_fraction=0.02):
+    lower = abs(target_velocity) * (1 - tolerance_fraction)
+    upper = abs(target_velocity) * (1 + tolerance_fraction)
+
+    abs_speed = df["Speed(d/s)"].abs()
+    valid_velocity = abs_speed.between(lower, upper)
+
+    return abs_speed, valid_velocity, lower, upper
+
+
+def get_velocity_based_rep_window(
+    segment,
     start_idx,
-    end_idx,
     valid_velocity,
-    torque_threshold,
 ):
     """
-    Refines a position-based segment so that the exported rep starts and ends
-    around the actual movement, rather than including too much quiet baseline.
+    Returns the first and last sample in the segment where speed is within
+    the target velocity threshold.
+
+    These points are used as the shaded start and shaded end points.
     """
 
-    segment = working.iloc[start_idx:end_idx + 1].copy()
-    segment_valid_velocity = valid_velocity.iloc[start_idx:end_idx + 1]
+    segment_valid = valid_velocity.iloc[start_idx:start_idx + len(segment)]
+    true_positions = np.where(segment_valid.to_numpy())[0]
 
-    torque_abs = segment["Torque(Newton-Meters)"].abs()
+    if len(true_positions) == 0:
+        return None, None
 
-    movement_mask = (
-        segment_valid_velocity.reset_index(drop=True)
-        | (torque_abs.reset_index(drop=True) > torque_threshold)
+    shade_start_idx = start_idx + int(true_positions[0])
+    shade_end_idx = start_idx + int(true_positions[-1])
+
+    return shade_start_idx, shade_end_idx
+
+
+def check_velocity_maintained_between_20_60(
+    rep_df,
+    target_velocity,
+    tolerance_fraction=0.02,
+    angle_lower=20.0,
+    angle_upper=60.0,
+    required_valid_fraction=0.95,
+):
+    """
+    Checks whether velocity is maintained within the target velocity threshold
+    between 20 and 60 degrees.
+
+    A rep is marked as valid only if:
+    - it reaches the target velocity threshold at least once
+    - there are samples between 20 and 60 degrees
+    - at least required_valid_fraction of points between 20 and 60 degrees are
+      within the target velocity threshold
+    """
+
+    abs_speed, valid_velocity, lower, upper = get_velocity_valid_mask(
+        rep_df,
+        target_velocity=target_velocity,
+        tolerance_fraction=tolerance_fraction,
     )
 
-    movement_indices = np.where(movement_mask.to_numpy())[0]
+    if not bool(valid_velocity.any()):
+        return False, 0.0, "Speed never entered target velocity threshold"
 
-    if len(movement_indices) == 0:
-        return start_idx, end_idx
+    angle_mask = rep_df["Position(Degrees)"].between(
+        angle_lower,
+        angle_upper,
+        inclusive="both",
+    )
 
-    refined_start = start_idx + int(movement_indices[0])
-    refined_end = start_idx + int(movement_indices[-1])
+    if not bool(angle_mask.any()):
+        return False, 0.0, "No data between 20 and 60 degrees"
 
-    if refined_end <= refined_start:
-        return start_idx, end_idx
+    valid_between_angles = valid_velocity[angle_mask]
+    valid_fraction = float(valid_between_angles.mean())
 
-    return refined_start, refined_end
+    if valid_fraction < required_valid_fraction:
+        reason = (
+            f"Velocity not maintained between 20 and 60 degrees "
+            f"({valid_fraction * 100:.1f}% valid)"
+        )
+        return False, valid_fraction, reason
+
+    return True, valid_fraction, "Valid"
 
 
 def identify_reps_with_velocity_rule(
@@ -269,27 +316,29 @@ def identify_reps_with_velocity_rule(
     """
     Rep detection using:
     - +/- 2% target velocity threshold
-    - position direction change to confirm rep changes
-
-    This prevents multiple local torque peaks within the same movement from
-    being incorrectly counted as separate repetitions.
+    - position direction changes to confirm rep changes
+    - shaded start/end points based only on where speed is within the target
+      velocity threshold
+    - red highlighting for reps that do not reach or maintain target speed
+      between 20 and 60 degrees
     """
 
     working = df.copy().reset_index(drop=True)
 
-    lower = abs(target_velocity) * (1 - tolerance_fraction)
-    upper = abs(target_velocity) * (1 + tolerance_fraction)
+    abs_speed, valid_velocity, lower, upper = get_velocity_valid_mask(
+        working,
+        target_velocity=target_velocity,
+        tolerance_fraction=tolerance_fraction,
+    )
 
-    working["Abs Speed(d/s)"] = working["Speed(d/s)"].abs()
-    valid_velocity = working["Abs Speed(d/s)"].between(lower, upper)
+    working["Abs Speed(d/s)"] = abs_speed
+    working["Within Target Velocity"] = valid_velocity
 
     torque_abs = working["Torque(Newton-Meters)"].abs()
     max_torque = float(torque_abs.max())
 
     if max_torque <= 0:
         return pd.DataFrame(), pd.DataFrame()
-
-    torque_threshold = max(5.0, max_torque * 0.03)
 
     boundaries = find_position_direction_boundaries(
         working=working,
@@ -310,16 +359,16 @@ def identify_reps_with_velocity_rule(
     min_rep_samples = max(5, int(consecutive_points / 2))
 
     for boundary_number in range(len(boundaries) - 1):
-        start_idx = int(boundaries[boundary_number])
-        end_idx = int(boundaries[boundary_number + 1])
+        segment_start_idx = int(boundaries[boundary_number])
+        segment_end_idx = int(boundaries[boundary_number + 1])
 
-        if end_idx <= start_idx:
+        if segment_end_idx <= segment_start_idx:
             continue
 
-        if end_idx - start_idx + 1 < min_rep_samples:
+        if segment_end_idx - segment_start_idx + 1 < min_rep_samples:
             continue
 
-        segment = working.iloc[start_idx:end_idx + 1].copy()
+        segment = working.iloc[segment_start_idx:segment_end_idx + 1].copy()
 
         position_change = abs(
             float(segment["Position(Degrees)"].iloc[-1])
@@ -329,31 +378,52 @@ def identify_reps_with_velocity_rule(
         if position_change < min_rep_position_change:
             continue
 
-        segment_valid_velocity = valid_velocity.iloc[start_idx:end_idx + 1]
-        segment_torque_peak = float(segment["Torque(Newton-Meters)"].abs().max())
-
-        if not bool(segment_valid_velocity.any()) and segment_torque_peak < torque_threshold:
-            continue
-
-        refined_start, refined_end = refine_segment_to_movement(
-            working=working,
-            start_idx=start_idx,
-            end_idx=end_idx,
+        shade_start_idx, shade_end_idx = get_velocity_based_rep_window(
+            segment=segment,
+            start_idx=segment_start_idx,
             valid_velocity=valid_velocity,
-            torque_threshold=torque_threshold,
         )
 
-        if refined_end <= refined_start:
+        if shade_start_idx is None or shade_end_idx is None:
+            export_start_idx = segment_start_idx
+            export_end_idx = segment_end_idx
+        else:
+            export_start_idx = shade_start_idx
+            export_end_idx = shade_end_idx
+
+        if export_end_idx <= export_start_idx:
             continue
 
-        rep_df = working.iloc[refined_start:refined_end + 1].copy()
+        rep_df = working.iloc[export_start_idx:export_end_idx + 1].copy()
 
         if len(rep_df) < min_rep_samples:
-            continue
+            rep_df = working.iloc[segment_start_idx:segment_end_idx + 1].copy()
+            export_start_idx = segment_start_idx
+            export_end_idx = segment_end_idx
+
+        rep_valid, valid_fraction_20_60, invalid_reason = (
+            check_velocity_maintained_between_20_60(
+                rep_df=rep_df,
+                target_velocity=target_velocity,
+                tolerance_fraction=tolerance_fraction,
+                angle_lower=ANGLE_CHECK_LOWER,
+                angle_upper=ANGLE_CHECK_UPPER,
+                required_valid_fraction=MIN_VALID_FRACTION_BETWEEN_20_60,
+            )
+        )
 
         rep_number += 1
+
         rep_df["Rep"] = rep_number
         rep_df["Rep Type"] = get_trial_label(rep_number, trial_type)
+        rep_df["Velocity Valid Rep"] = rep_valid
+        rep_df["Velocity Valid Fraction 20-60 deg"] = valid_fraction_20_60
+        rep_df["Velocity Validity Comment"] = invalid_reason
+        rep_df["Segment Start Index"] = segment_start_idx
+        rep_df["Segment End Index"] = segment_end_idx
+        rep_df["Shade Start Index"] = export_start_idx
+        rep_df["Shade End Index"] = export_end_idx
+
         reps.append(rep_df)
 
     if len(reps) == 0:
@@ -367,10 +437,17 @@ def identify_reps_with_velocity_rule(
         peak_idx = rep_df["Torque(Newton-Meters)"].abs().idxmax()
         peak_row = rep_df.loc[peak_idx]
 
+        velocity_valid_rep = bool(rep_df["Velocity Valid Rep"].iloc[0])
+        validity_comment = str(rep_df["Velocity Validity Comment"].iloc[0])
+        valid_fraction = float(rep_df["Velocity Valid Fraction 20-60 deg"].iloc[0])
+
         summary_rows.append(
             {
                 "Rep": int(rep_id),
                 "Rep Type": peak_row["Rep Type"],
+                "Velocity Valid Rep": velocity_valid_rep,
+                "Velocity Validity Comment": validity_comment,
+                "Velocity Valid Fraction 20-60 deg": valid_fraction,
                 "Start Time (s)": float(rep_df["Time(Seconds)"].iloc[0]),
                 "End Time (s)": float(rep_df["Time(Seconds)"].iloc[-1]),
                 "Duration (s)": float(
@@ -414,9 +491,11 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
     Raw data plot.
 
     This plot keeps time on the x-axis.
-    If reps are supplied, identified reps are shaded:
-    - green = included in export
-    - red = identified but excluded by manual override
+
+    Shading:
+    - green = rep reached and maintained target velocity between 20 and 60 deg
+    - red = rep did not reach target velocity or did not maintain it between 20 and 60 deg
+    - grey = rep excluded by manual override
     """
 
     fig, ax = plt.subplots(figsize=(11, 4.5))
@@ -439,12 +518,16 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
             start_time = float(row["Start Time (s)"])
             end_time = float(row["End Time (s)"])
 
-            if rep_number <= reps_to_export:
-                shade_colour = "tab:green"
-                alpha = 0.18
+            if rep_number > reps_to_export:
+                shade_colour = "lightgray"
+                alpha = 0.25
             else:
-                shade_colour = "tab:red"
-                alpha = 0.12
+                if bool(row["Velocity Valid Rep"]):
+                    shade_colour = "tab:green"
+                    alpha = 0.18
+                else:
+                    shade_colour = "tab:red"
+                    alpha = 0.22
 
             ax.axvspan(
                 start_time,
@@ -492,10 +575,17 @@ def make_rep_plot(rep_df, rep_type, rep_id):
 
     fig, ax = plt.subplots(figsize=(5, 3.2))
 
+    rep_valid = bool(rep_df["Velocity Valid Rep"].iloc[0])
+
+    if rep_valid:
+        line_colour = "tab:orange"
+    else:
+        line_colour = "tab:red"
+
     ax.plot(
         rep_df["Position(Degrees)"],
         rep_df["Torque(Newton-Meters)"],
-        color="tab:orange",
+        color=line_colour,
         linewidth=1.4,
     )
 
@@ -505,12 +595,24 @@ def make_rep_plot(rep_df, rep_type, rep_id):
     ax.scatter(
         [peak_row["Position(Degrees)"]],
         [peak_row["Torque(Newton-Meters)"]],
-        color="red",
+        color="black",
         s=35,
         zorder=3,
     )
 
-    ax.set_title(f"Rep {rep_id}: {rep_type}")
+    ax.axvspan(
+        ANGLE_CHECK_LOWER,
+        ANGLE_CHECK_UPPER,
+        color="lightgray",
+        alpha=0.18,
+    )
+
+    if rep_valid:
+        title_suffix = "Valid"
+    else:
+        title_suffix = "Velocity issue"
+
+    ax.set_title(f"Rep {rep_id}: {rep_type} | {title_suffix}")
     ax.set_xlabel("Angle / Position (Degrees)")
     ax.set_ylabel("Torque (Nm)")
     ax.grid(alpha=0.25)
@@ -556,8 +658,8 @@ def main():
         "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
         "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
         "Individual rep plots are shown as Torque vs Angle/Position. Reps are identified "
-        "using a +/- 2% target-velocity threshold, with position direction changes used "
-        "to confirm rep transitions."
+        "using position direction changes, and the shaded region is only the portion where "
+        "speed is within the +/- 2% target velocity threshold."
     )
 
     uploaded = st.file_uploader(
@@ -604,8 +706,9 @@ def main():
 
     with controls[2]:
         st.markdown("**Rep detection rule**")
-        st.write("Velocity match uses +/- 2% of target velocity.")
-        st.write("Position direction change confirms each new rep.")
+        st.write("Velocity threshold uses +/- 2% of target velocity.")
+        st.write("Rep changes are confirmed using position direction changes.")
+        st.write("Red reps fail the 20-60 degree velocity-maintenance check.")
 
     st.subheader("Raw torque-time plot")
 
@@ -625,7 +728,7 @@ def main():
         df=df,
         target_velocity=target_velocity,
         trial_type=trial_type,
-        tolerance_fraction=0.02,
+        tolerance_fraction=VELOCITY_TOLERANCE_FRACTION,
         consecutive_points=10,
     )
 
@@ -637,9 +740,12 @@ def main():
         return
 
     automatically_identified_reps = int(summary["Rep"].nunique())
+    valid_reps = int(summary["Velocity Valid Rep"].sum())
+    invalid_reps = automatically_identified_reps - valid_reps
 
     st.success(
-        f"Automatic detection identified {automatically_identified_reps} reps."
+        f"Automatic detection identified {automatically_identified_reps} reps. "
+        f"{valid_reps} passed the velocity check and {invalid_reps} were flagged red."
     )
 
     st.subheader("Manual rep override for final export")
@@ -682,8 +788,9 @@ def main():
     plt.close(raw_fig_with_reps)
 
     st.caption(
-        "Green shaded regions are reps selected for export. "
-        "Red shaded regions are reps identified automatically but excluded by the manual override."
+        "Green shaded regions are accepted reps. Red shaded regions are reps where speed "
+        "did not enter the target threshold or was not maintained between 20 and 60 degrees. "
+        "Grey shaded regions are excluded by the manual override."
     )
 
     st.subheader("Rep summary table selected for export")
@@ -697,7 +804,8 @@ def main():
     st.subheader("Rep figures selected for export")
 
     st.write(
-        "These individual rep figures use angle/position on the x-axis."
+        "These individual rep figures use angle/position on the x-axis. "
+        "The grey background band marks 20-60 degrees."
     )
 
     rep_ids = sorted(reps_long_export["Rep"].unique())
