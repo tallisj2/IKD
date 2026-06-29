@@ -272,8 +272,6 @@ def check_velocity_maintained_between_angles(
     """
     Checks whether velocity stays above the lower threshold between the selected
     angle limits.
-
-    This is now manually adjustable in the app.
     """
 
     if angle_upper < angle_lower:
@@ -334,12 +332,6 @@ def identify_reps_with_velocity_rule(
     - position direction change to identify rep transitions
     - lower-bound velocity threshold for shaded start/end points
     - manually adjustable angle-window validity check
-
-    Important:
-    The 2% rule is lower-bound only.
-
-    Valid speed = absolute speed >= target velocity x 0.98 by default.
-    Speeds higher than target are accepted.
     """
 
     working = df.copy().reset_index(drop=True)
@@ -513,34 +505,123 @@ def identify_reps_with_velocity_rule(
     return reps_long, summary
 
 
-def filter_reps_for_export(reps_long, summary, reps_to_export):
+def filter_reps_for_export(reps_long, summary, reps_to_export, reps_to_exclude=None):
     """
-    Keeps only the first selected number of automatically identified reps.
+    Keeps only the selected automatically identified reps and removes any manually
+    excluded reps.
 
-    This does not create new reps. It only controls how many of the identified
-    reps are included in the final summary, figures, and Excel export.
+    reps_to_export controls the first N reps considered.
+    reps_to_exclude removes specific reps from the final export.
     """
 
     reps_to_export = int(reps_to_export)
 
-    filtered_reps = reps_long[reps_long["Rep"] <= reps_to_export].copy()
-    filtered_summary = summary[summary["Rep"] <= reps_to_export].copy()
+    if reps_to_exclude is None:
+        reps_to_exclude = []
+
+    reps_to_exclude = [int(rep) for rep in reps_to_exclude]
+
+    filtered_reps = reps_long[
+        (reps_long["Rep"] <= reps_to_export)
+        & (~reps_long["Rep"].isin(reps_to_exclude))
+    ].copy()
+
+    filtered_summary = summary[
+        (summary["Rep"] <= reps_to_export)
+        & (~summary["Rep"].isin(reps_to_exclude))
+    ].copy()
 
     return filtered_reps, filtered_summary
 
 
-def make_raw_plot(df, summary=None, reps_to_export=None):
+def calculate_torque_position_range_stats(
+    reps_long_df,
+    angle_lower,
+    angle_upper,
+):
+    """
+    Calculates mean and SD torque within the selected position range for each
+    action type.
+    """
+
+    if reps_long_df.empty:
+        return pd.DataFrame()
+
+    if angle_upper < angle_lower:
+        angle_lower, angle_upper = angle_upper, angle_lower
+
+    df = reps_long_df.copy()
+
+    in_range = df["Position(Degrees)"].between(
+        angle_lower,
+        angle_upper,
+        inclusive="both",
+    )
+
+    df_range = df[in_range].copy()
+
+    if df_range.empty:
+        return pd.DataFrame(
+            columns=[
+                "Rep Type",
+                "Position Range Lower (deg)",
+                "Position Range Upper (deg)",
+                "Number of Reps",
+                "Number of Data Points",
+                "Mean Torque (Nm)",
+                "SD Torque (Nm)",
+                "Minimum Torque (Nm)",
+                "Maximum Torque (Nm)",
+            ]
+        )
+
+    grouped = df_range.groupby("Rep Type", sort=True)
+
+    stats = grouped.agg(
+        Number_of_Reps=("Rep", "nunique"),
+        Number_of_Data_Points=("Torque(Newton-Meters)", "count"),
+        Mean_Torque_Nm=("Torque(Newton-Meters)", "mean"),
+        SD_Torque_Nm=("Torque(Newton-Meters)", "std"),
+        Minimum_Torque_Nm=("Torque(Newton-Meters)", "min"),
+        Maximum_Torque_Nm=("Torque(Newton-Meters)", "max"),
+    ).reset_index()
+
+    stats = stats.rename(
+        columns={
+            "Number_of_Reps": "Number of Reps",
+            "Number_of_Data_Points": "Number of Data Points",
+            "Mean_Torque_Nm": "Mean Torque (Nm)",
+            "SD_Torque_Nm": "SD Torque (Nm)",
+            "Minimum_Torque_Nm": "Minimum Torque (Nm)",
+            "Maximum_Torque_Nm": "Maximum Torque (Nm)",
+        }
+    )
+
+    stats.insert(1, "Position Range Lower (deg)", float(angle_lower))
+    stats.insert(2, "Position Range Upper (deg)", float(angle_upper))
+
+    return stats
+
+
+def make_raw_plot(
+    df,
+    summary=None,
+    reps_to_export=None,
+    reps_to_exclude=None,
+):
     """
     Raw torque-time plot.
 
     Shading:
     - green = rep passed the manually selected velocity check
     - red = rep failed the manually selected velocity check
-    - grey = rep excluded by manual override
-
-    The shaded window uses only the part of the rep where speed is above
-    the lower velocity threshold.
+    - grey = rep excluded by manual override or beyond selected export count
     """
+
+    if reps_to_exclude is None:
+        reps_to_exclude = []
+
+    reps_to_exclude = [int(rep) for rep in reps_to_exclude]
 
     fig, ax = plt.subplots(figsize=(11, 4.5))
 
@@ -562,9 +643,9 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
             start_time = float(row["Start Time (s)"])
             end_time = float(row["End Time (s)"])
 
-            if rep_number > reps_to_export:
+            if rep_number > reps_to_export or rep_number in reps_to_exclude:
                 shade_colour = "lightgray"
-                alpha = 0.25
+                alpha = 0.30
             else:
                 if bool(row["Velocity Valid Rep"]):
                     shade_colour = "tab:green"
@@ -593,9 +674,17 @@ def make_raw_plot(df, summary=None, reps_to_export=None):
                 rotation=90,
             )
 
+        exported_count = len(
+            [
+                rep
+                for rep in summary["Rep"].astype(int).tolist()
+                if rep <= int(reps_to_export) and rep not in reps_to_exclude
+            ]
+        )
+
         title = (
             f"Raw Torque vs Time | Automatically identified reps: "
-            f"{automatically_identified} | Reps selected for export: {int(reps_to_export)}"
+            f"{automatically_identified} | Final exported reps: {exported_count}"
         )
 
     else:
@@ -622,8 +711,6 @@ def make_rep_plot(
 ):
     """
     Individual rep plot.
-
-    These subplots use angle/position on the x-axis.
 
     Torque = left y-axis.
     Velocity = right y-axis.
@@ -718,20 +805,38 @@ def make_rep_plot(
     return fig
 
 
-def build_export_excel(raw_df, summary_df, reps_long_df):
+def build_export_excel(
+    raw_df,
+    summary_df,
+    reps_long_df,
+    angle_lower,
+    angle_upper,
+):
     """
     Export everything into one Excel workbook with multiple tabs:
     - Raw_Data
     - Summary
+    - Torque_Position_Range_Stats
     - All_Reps_Long
     - one sheet per exported rep
     """
 
     output = io.BytesIO()
 
+    torque_stats_df = calculate_torque_position_range_stats(
+        reps_long_df=reps_long_df,
+        angle_lower=angle_lower,
+        angle_upper=angle_upper,
+    )
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         raw_df.to_excel(writer, sheet_name="Raw_Data", index=False)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        torque_stats_df.to_excel(
+            writer,
+            sheet_name="Torque_Position_Range_Stats",
+            index=False,
+        )
 
         reps_export = reps_long_df.drop(columns=["Abs Speed(d/s)"], errors="ignore")
         reps_export.to_excel(writer, sheet_name="All_Reps_Long", index=False)
@@ -745,20 +850,44 @@ def build_export_excel(raw_df, summary_df, reps_long_df):
 
     output.seek(0)
 
-    return output.getvalue()
+    return output.getvalue(), torque_stats_df
 
 
 def main():
     st.set_page_config(page_title="Isokinetic Trial App", layout="wide")
     st.title("Isokinetic Trial Analysis")
 
+    st.markdown(
+        """
+        ### Isokinetic Data Processing App
+
+        **Developed by Dr Jason Tallis**  
+        **Contact:** AB0289@coventry.ac.uk
+
+        This app has been developed to support the processing of isokinetic dynamometry
+        trial data. It is designed to identify individual repetitions, inspect torque
+        and velocity traces, apply velocity-threshold quality checks, manually exclude
+        poor-quality or unwanted repetitions, and export cleaned repetition-level data
+        for further analysis.
+
+        **Purpose and function**
+
+        - Upload CSV, TXT, XLSX, or XLS files containing isokinetic trial data.
+        - The first four columns are read as **Time**, **Position**, **Torque**, and **Speed**.
+        - Repetitions are identified using **position direction changes**.
+        - The raw trace is displayed as **Torque vs Time**.
+        - Individual repetition figures are displayed as **Torque vs Position**, with velocity shown on a secondary axis.
+        - A lower-bound velocity threshold can be applied to identify reps where speed falls below the selected criterion.
+        - The angle range for velocity checking and torque summary calculations can be manually changed.
+        - Reps can be manually excluded from the final output.
+        - The Excel export includes raw data, summary data, all included repetitions, individual rep sheets, and mean/SD torque within the selected position range by action type.
+        """
+    )
+
     st.write(
-        "Upload a CSV, TXT, XLSX, or XLS file. The app reads the first four columns as "
-        "Time, Position, Torque, and Speed. The raw data plot is shown as Torque vs Time. "
-        "Individual rep plots are shown as Torque vs Angle/Position, with velocity shown "
-        "on a secondary y-axis. Reps are identified using position direction changes. "
-        "The speed rule is lower-bound only: speed must not fall below the selected "
-        "percentage of the target velocity. Speeds higher than target are accepted."
+        "Upload a data file and then adjust the trial type, target velocity, velocity "
+        "threshold, and position range as needed. The final export only includes the reps "
+        "selected for output and not manually excluded."
     )
 
     uploaded = st.file_uploader(
@@ -824,14 +953,14 @@ def main():
 
     with validity_cols[0]:
         angle_lower = st.number_input(
-            "Velocity check lower angle (degrees)",
+            "Velocity/torque calculation lower angle (degrees)",
             value=float(DEFAULT_ANGLE_CHECK_LOWER),
             step=1.0,
         )
 
     with validity_cols[1]:
         angle_upper = st.number_input(
-            "Velocity check upper angle (degrees)",
+            "Velocity/torque calculation upper angle (degrees)",
             value=float(DEFAULT_ANGLE_CHECK_UPPER),
             step=1.0,
         )
@@ -845,8 +974,8 @@ def main():
             step=5.0,
             help=(
                 "100% means every point in the selected angle range must be above "
-                "the lower velocity threshold. Lower this if you want to allow "
-                "brief drops below the threshold."
+                "the lower velocity threshold. Lower this if brief drops below the "
+                "threshold are acceptable."
             ),
         )
 
@@ -862,7 +991,8 @@ def main():
         f"{lower_velocity_threshold:.2f} d/s between {angle_lower:.1f} and "
         f"{angle_upper:.1f} degrees for more than "
         f"{100 - required_valid_percent:.1f}% of the available points. "
-        f"Speeds above target velocity are accepted."
+        f"Speeds above target velocity are accepted. The same angle range is used "
+        f"to calculate the torque mean and SD by action type in the Excel export."
     )
 
     st.subheader("Raw torque-time plot")
@@ -906,32 +1036,65 @@ def main():
         f"{invalid_reps} were flagged red."
     )
 
-    st.subheader("Manual rep override for final export")
+    st.subheader("Manual rep selection for final export")
 
     reps_to_export = st.number_input(
-        "How many of the identified reps should be included in the final export?",
+        "How many of the identified reps should be considered for the final export?",
         min_value=1,
         max_value=automatically_identified_reps,
         value=automatically_identified_reps,
         step=1,
         help=(
-            "Use this if the automatic detection has identified too many reps. "
-            "The export will include the first selected number of identified reps."
+            "This keeps the first selected number of identified reps. "
+            "You can then manually exclude individual reps below."
         ),
     )
 
     reps_to_export = int(reps_to_export)
 
+    candidate_reps = list(range(1, reps_to_export + 1))
+
+    reps_to_exclude = st.multiselect(
+        "Select reps to exclude from the final output",
+        options=candidate_reps,
+        default=[],
+        help=(
+            "These reps will be removed from the Summary, All_Reps_Long, individual "
+            "rep sheets, rep figures, and torque mean/SD calculations."
+        ),
+    )
+
+    reps_to_exclude = [int(rep) for rep in reps_to_exclude]
+
+    final_rep_count = reps_to_export - len(reps_to_exclude)
+
+    if final_rep_count <= 0:
+        st.error("All selected reps have been excluded. Keep at least one rep for export.")
+        return
+
     if reps_to_export < automatically_identified_reps:
         st.warning(
             f"{automatically_identified_reps} reps were automatically identified, "
-            f"but only the first {reps_to_export} reps will be included in the final export."
+            f"but only the first {reps_to_export} reps are being considered."
+        )
+
+    if len(reps_to_exclude) > 0:
+        st.warning(
+            f"The following reps will be excluded from the final output: "
+            f"{', '.join(str(rep) for rep in reps_to_exclude)}"
         )
 
     reps_long_export, summary_export = filter_reps_for_export(
         reps_long=reps_long,
         summary=summary,
         reps_to_export=reps_to_export,
+        reps_to_exclude=reps_to_exclude,
+    )
+
+    torque_stats_df = calculate_torque_position_range_stats(
+        reps_long_df=reps_long_export,
+        angle_lower=angle_lower,
+        angle_upper=angle_upper,
     )
 
     st.subheader("Raw torque-time plot with identified reps")
@@ -940,6 +1103,7 @@ def main():
         df=df,
         summary=summary,
         reps_to_export=reps_to_export,
+        reps_to_exclude=reps_to_exclude,
     )
 
     st.pyplot(raw_fig_with_reps)
@@ -947,11 +1111,20 @@ def main():
 
     st.caption(
         "Green shaded regions are accepted reps. Red shaded regions failed the current "
-        "manual velocity rule. Grey shaded regions are excluded by the manual override."
+        "manual velocity rule. Grey shaded regions are excluded from the final output."
     )
 
     st.subheader("Rep summary table selected for export")
     st.dataframe(summary_export, use_container_width=True)
+
+    st.subheader("Torque mean and SD within selected position range")
+
+    st.write(
+        f"Calculated using exported reps only, between {angle_lower:.1f} and "
+        f"{angle_upper:.1f} degrees."
+    )
+
+    st.dataframe(torque_stats_df, use_container_width=True)
 
     st.subheader("All automatically identified reps")
 
@@ -963,7 +1136,7 @@ def main():
     st.write(
         "Each individual rep figure shows torque against angle/position on the left axis "
         "and velocity magnitude on the right axis. The grey band shows the selected angle "
-        "range used for the velocity check."
+        "range used for the velocity check and torque mean/SD calculation."
     )
 
     rep_ids = sorted(reps_long_export["Rep"].unique())
@@ -992,21 +1165,16 @@ def main():
             col_obj.pyplot(fig)
             plt.close(fig)
 
-    excel_bytes = build_export_excel(
+    excel_bytes, torque_stats_export = build_export_excel(
         raw_df=df,
         summary_df=summary_export,
         reps_long_df=reps_long_export,
+        angle_lower=angle_lower,
+        angle_upper=angle_upper,
     )
 
     st.download_button(
         label="Download selected reps as one Excel file (.xlsx)",
         data=excel_bytes,
         file_name="isokinetic_rep_analysis_selected_reps.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-
-if __name__ == "__main__":
-    main()
-
+        mime="application/vnd.openxmlformats-off)
